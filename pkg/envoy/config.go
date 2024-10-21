@@ -1,10 +1,14 @@
 package envoy
 
 import (
+	"fmt"
+	header_mutationv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/header_mutation/v3"
+
 	"github.com/ghodss/yaml"
 
 	envoyconfigbootstrapv3 "github.com/envoyproxy/go-control-plane/envoy/config/bootstrap/v3"
 	envoyconfigclusterv3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
+	envoymutationrulesv3 "github.com/envoyproxy/go-control-plane/envoy/config/common/mutation_rules/v3"
 	envoyconfigcorev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	envoyendpointv3 "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
 	envoylistenerv3 "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
@@ -50,10 +54,36 @@ type BackendOptions struct {
 	BackendConfig Backend
 	// MatchRouteRegex is the regex that the backend service will match on.
 	MatchRouteRegex string
+	// HeaderMutations is the mutations to be applied to HTTP headers.
+	// These mutations will be applied to the incoming HTTP request before it is matched with a route.
+	HeaderMutations HeaderMutations
 	clusterName     string
 	statsPrefix     string
 	listenerName    string
 	listenerPort    uint32
+}
+
+// HeaderMutation represents a mutation to be applied to HTTP headers.
+// It contains the header to be set and the value to set it to.
+type HeaderMutation struct {
+	// SetHeader is the name of the header to be set.
+	SetHeader string
+	// FromValue is the value to set the header to, implementing the fmt.Stringer interface.
+	FromValue fmt.Stringer
+}
+
+type HeaderMutations []HeaderMutation
+
+// ExistingHeaderMutation represents a mutation that extracts a value from an existing HTTP request header.
+// It contains the name of the header to look for in the incoming HTTP request.
+type ExistingHeaderMutation struct {
+	// FromRequestHeader specifies the header to look for in the incoming HTTP request.
+	FromRequestHeader string
+}
+
+// String returns the string representation of the ExistingHeaderMutation.
+func (ehm ExistingHeaderMutation) String() string {
+	return fmt.Sprintf(`%%REQ(%s)%%`, ehm.FromRequestHeader)
 }
 
 // Options is the configuration for the gateway.
@@ -93,6 +123,7 @@ func (opts Options) BuildOrDie() string {
 	marshalOpts := protojson.MarshalOptions{Indent: "  "}
 	b, err := marshalOpts.Marshal(bootstrap)
 	if err != nil {
+		fmt.Println(err)
 		panic(err)
 
 	}
@@ -106,6 +137,10 @@ func (opts Options) BuildOrDie() string {
 
 func buildListenerConfig(opts BackendOptions) *envoylistenerv3.Listener {
 	var httpFilters []*envoyconfigmanagerv3.HttpFilter
+	if len(opts.HeaderMutations) > 0 {
+		httpFilters = append(httpFilters, opts.HeaderMutations.toHttpFilter())
+	}
+
 	connManager := buildHTTPConnectionManager(opts, httpFilters)
 	pbCM, err := anypb.New(connManager)
 	if err != nil {
@@ -285,4 +320,43 @@ func buildEnvoyAdminConfig() *envoyconfigbootstrapv3.Admin {
 		},
 	}
 	return admin
+}
+
+func (hm HeaderMutations) toHttpFilter() *envoyconfigmanagerv3.HttpFilter {
+	var headerMutations = make([]*envoymutationrulesv3.HeaderMutation, len(hm))
+	for i, h := range hm {
+		headerMutations[i] = &envoymutationrulesv3.HeaderMutation{
+			Action: &envoymutationrulesv3.HeaderMutation_Append{
+				Append: &envoyconfigcorev3.HeaderValueOption{
+					Header: &envoyconfigcorev3.HeaderValue{
+						Key:   h.SetHeader,
+						Value: h.FromValue.String(),
+					},
+					AppendAction:   envoyconfigcorev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD,
+					KeepEmptyValue: false,
+				},
+			},
+		}
+	}
+
+	filter := header_mutationv3.HeaderMutation{
+		Mutations: &header_mutationv3.Mutations{
+			RequestMutations: headerMutations,
+		},
+	}
+
+	filterPB, err := anypb.New(&filter)
+	if err != nil {
+		panic(err)
+	}
+
+	return &envoyconfigmanagerv3.HttpFilter{
+		Name: "envoy.filters.http.header_mutation",
+		ConfigType: &envoyconfigmanagerv3.HttpFilter_TypedConfig{
+			TypedConfig: &anypb.Any{
+				TypeUrl: "type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutation",
+				Value:   filterPB.GetValue(),
+			},
+		},
+	}
 }

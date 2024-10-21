@@ -1,7 +1,9 @@
 package envoy
 
 import (
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -142,6 +144,53 @@ func TestOpts_Routing(t *testing.T) {
 	}
 }
 
+func TestOpts_HeaderManipulation(t *testing.T) {
+	fromHeader := "X-Some-Test-Header"
+	fromHeaderVal := "test"
+	toHeader := "X-Thanos-Tenant"
+
+	opts := Options{
+		MetricsReadOptions: &BackendOptions{
+			BackendConfig: Backend{
+				Address: httpbinName,
+				Port:    httpPort,
+			},
+			MatchRouteRegex: testReadPath,
+			HeaderMutations: []HeaderMutation{
+				{
+					SetHeader: toHeader,
+					FromValue: ExistingHeaderMutation{
+						FromRequestHeader: fromHeader,
+					},
+				},
+			},
+		},
+	}
+	resource := runEnvoy(t, opts.BuildOrDie())
+	readPort := resource.GetPort(fmt.Sprintf("%d/tcp", MetricsReadListenerPort))
+	url := fmt.Sprintf("http://localhost:%s%s", readPort, testReadPath)
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatalf("could not create request: %s", err)
+	}
+	req.Header.Add(fromHeader, fromHeaderVal)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		fmt.Println(err)
+		t.Fatalf("could not get response: %s", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected status code 200, got %d", resp.StatusCode)
+	}
+	respBody := getAnythingResponseBody(t, resp.Body)
+	if respBody.Headers[toHeader] != fromHeaderVal {
+		t.Fatalf("expected header %s to be %s, got %s", toHeader, fromHeaderVal, respBody.Headers[toHeader])
+	}
+}
+
 func runEnvoy(t *testing.T, withConfig string) *dockertest.Resource {
 	t.Helper()
 	dir := t.TempDir()
@@ -221,4 +270,14 @@ type anythingResponse struct {
 	Method  string            `json:"method"`
 	Origin  string            `json:"origin"`
 	URL     string            `json:"url"`
+}
+
+func getAnythingResponseBody(t *testing.T, closer io.ReadCloser) anythingResponse {
+	t.Helper()
+	var anyResp anythingResponse
+	err := json.NewDecoder(closer).Decode(&anyResp)
+	if err != nil {
+		t.Fatalf("could not decode response: %s", err)
+	}
+	return anyResp
 }
