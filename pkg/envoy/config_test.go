@@ -191,6 +191,57 @@ func TestOpts_HeaderManipulation(t *testing.T) {
 	}
 }
 
+func TestOpts_HeaderAmendments(t *testing.T) {
+	someHeaderToInitiallySend := "X-Some-Test-Header-To-Send"
+	someHeaderToInitiallySendVal := "test-send"
+
+	someHeaderToAddAtRouteMatch := "X-Some-Test-Header"
+	someHeaderToAddAtRouteMatchVal := "test-add"
+	opts := Options{
+		MetricsReadOptions: &BackendOptions{
+			HeaderAmendments: HeaderAmendments{
+				AddHeaders: map[string]string{
+					someHeaderToAddAtRouteMatch: someHeaderToAddAtRouteMatchVal,
+				},
+				RemoveHeaders: []string{someHeaderToInitiallySend},
+			},
+			MatchRouteRegex: testReadPath,
+			BackendConfig: Backend{
+				Address: httpbinName,
+				Port:    httpPort,
+			},
+		},
+	}
+	resource := runEnvoy(t, opts.BuildOrDie())
+	port := resource.GetPort(fmt.Sprintf("%d/tcp", MetricsReadListenerPort))
+	url := fmt.Sprintf("http://localhost:%s%s", port, testReadPath)
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatalf("could not create request: %s", err)
+	}
+
+	req.Header.Add(someHeaderToInitiallySend, someHeaderToInitiallySendVal)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("could not get response: %s", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected status code 200, got %d", resp.StatusCode)
+	}
+	respBody := getAnythingResponseBody(t, resp.Body)
+	_, ok := respBody.Headers[someHeaderToInitiallySend]
+	if ok {
+		t.Fatalf("expected header %s to be removed", someHeaderToInitiallySend)
+	}
+
+	if respBody.Headers[someHeaderToAddAtRouteMatch] != someHeaderToAddAtRouteMatchVal {
+		t.Fatalf("expected header %s to be %s, got %s", someHeaderToAddAtRouteMatch, someHeaderToAddAtRouteMatchVal, respBody.Headers[someHeaderToAddAtRouteMatch])
+	}
+}
+
 func runEnvoy(t *testing.T, withConfig string) *dockertest.Resource {
 	t.Helper()
 	dir := t.TempDir()

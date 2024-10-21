@@ -2,7 +2,6 @@ package envoy
 
 import (
 	"fmt"
-	header_mutationv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/header_mutation/v3"
 
 	"github.com/ghodss/yaml"
 
@@ -13,6 +12,7 @@ import (
 	envoyendpointv3 "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
 	envoylistenerv3 "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	envoyroutev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+	envoyheadermutationv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/header_mutation/v3"
 	envoyrouterv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/router/v3"
 	envoyconfigmanagerv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	envoymatcher "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
@@ -57,10 +57,12 @@ type BackendOptions struct {
 	// HeaderMutations is the mutations to be applied to HTTP headers.
 	// These mutations will be applied to the incoming HTTP request before it is matched with a route.
 	HeaderMutations HeaderMutations
-	clusterName     string
-	statsPrefix     string
-	listenerName    string
-	listenerPort    uint32
+	// HeaderAmendments allows the addition and removal of headers after a route is matched but before the request is sent to the backend.
+	HeaderAmendments HeaderAmendments
+	clusterName      string
+	statsPrefix      string
+	listenerName     string
+	listenerPort     uint32
 }
 
 // HeaderMutation represents a mutation to be applied to HTTP headers.
@@ -84,6 +86,15 @@ type ExistingHeaderMutation struct {
 // String returns the string representation of the ExistingHeaderMutation.
 func (ehm ExistingHeaderMutation) String() string {
 	return fmt.Sprintf(`%%REQ(%s)%%`, ehm.FromRequestHeader)
+}
+
+// HeaderAmendments allows the addition and removal of headers after a route is
+// matched but before the request is sent to the backend.
+type HeaderAmendments struct {
+	// AddHeaders is a map of headers to add to the request.
+	AddHeaders map[string]string
+	// RemoveHeaders is a list of headers to remove from the request.
+	RemoveHeaders []string
 }
 
 // Options is the configuration for the gateway.
@@ -289,6 +300,17 @@ func buildEnvoyCluster(name string, scheme, address string, port uint32, discove
 
 // toRoute returns the envoy route for the backend.
 func (b BackendOptions) toRoute() *envoyroutev3.Route {
+	var requestHeaderToAdd []*envoyconfigcorev3.HeaderValueOption
+	for header, value := range b.HeaderAmendments.AddHeaders {
+		requestHeaderToAdd = append(requestHeaderToAdd, &envoyconfigcorev3.HeaderValueOption{
+			Header: &envoyconfigcorev3.HeaderValue{
+				Key:   header,
+				Value: value,
+			},
+			AppendAction: envoyconfigcorev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD,
+		})
+	}
+
 	return &envoyroutev3.Route{
 		Match: &envoyroutev3.RouteMatch{
 			PathSpecifier: &envoyroutev3.RouteMatch_SafeRegex{
@@ -302,6 +324,8 @@ func (b BackendOptions) toRoute() *envoyroutev3.Route {
 				ClusterSpecifier: &envoyroutev3.RouteAction_Cluster{Cluster: b.clusterName},
 			},
 		},
+		RequestHeadersToAdd:    requestHeaderToAdd,
+		RequestHeadersToRemove: b.HeaderAmendments.RemoveHeaders,
 	}
 }
 
@@ -339,8 +363,8 @@ func (hm HeaderMutations) toHttpFilter() *envoyconfigmanagerv3.HttpFilter {
 		}
 	}
 
-	filter := header_mutationv3.HeaderMutation{
-		Mutations: &header_mutationv3.Mutations{
+	filter := envoyheadermutationv3.HeaderMutation{
+		Mutations: &envoyheadermutationv3.Mutations{
 			RequestMutations: headerMutations,
 		},
 	}
