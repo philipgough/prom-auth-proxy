@@ -243,6 +243,56 @@ func TestOpts_HeaderAmendments(t *testing.T) {
 	}
 }
 
+func TestOpts_HeaderMatching(t *testing.T) {
+	fromHeader := "X-Some-Test-Header"
+	fromHeaderVal := "test"
+
+	opts := Options{
+		MetricsReadOptions: &BackendOptions{
+			HeaderMatcher: &HeaderMatcher{
+				Name:  fromHeader,
+				Regex: fromHeaderVal,
+			},
+			MatchRouteRegex: testReadPath,
+			BackendConfig: Backend{
+				Address: httpbinName,
+				Port:    httpPort,
+			},
+		},
+	}
+	resource := runEnvoy(t, opts.BuildOrDie())
+	port := resource.GetPort(fmt.Sprintf("%d/tcp", MetricsReadListenerPort))
+	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("http://localhost:%s%s", port, testReadPath), nil)
+	if err != nil {
+		t.Fatalf("could not create request: %s", err)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("could not get response: %s", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected status code 404, got %d", resp.StatusCode)
+	}
+
+	req, err = http.NewRequest(http.MethodGet, fmt.Sprintf("http://localhost:%s%s", port, testReadPath), nil)
+	if err != nil {
+		t.Fatalf("could not create request: %s", err)
+	}
+	req.Header.Add(fromHeader, fromHeaderVal)
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("could not get response: %s", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected status code 200, got %d", resp.StatusCode)
+	}
+}
+
 func TestOpts_TokenAuth_JWT(t *testing.T) {
 	providerName := "istio_demo"
 	jwtProvider := JWTProvider{

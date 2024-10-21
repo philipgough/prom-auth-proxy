@@ -62,11 +62,14 @@ type BackendOptions struct {
 	HeaderMutations HeaderMutations
 	// HeaderAmendments allows the addition and removal of headers after a route is matched but before the request is sent to the backend.
 	HeaderAmendments HeaderAmendments
-	TokenAuthConfig  BackendTokenAuthConfig
-	clusterName      string
-	statsPrefix      string
-	listenerName     string
-	listenerPort     uint32
+	// HeaderMatcher is the header matcher that matches a header name and value.
+	HeaderMatcher *HeaderMatcher
+	// TokenAuthConfig is the configuration for token authentication.
+	TokenAuthConfig BackendTokenAuthConfig
+	clusterName     string
+	statsPrefix     string
+	listenerName    string
+	listenerPort    uint32
 }
 
 // HeaderMutation represents a mutation to be applied to HTTP headers.
@@ -99,6 +102,13 @@ type HeaderAmendments struct {
 	AddHeaders map[string]string
 	// RemoveHeaders is a list of headers to remove from the request.
 	RemoveHeaders []string
+}
+
+// HeaderMatcher represents a header matcher that matches a header name and value.
+// This can be used to enforce that a header is present and has a specific value.
+type HeaderMatcher struct {
+	Name  string
+	Regex string
 }
 
 // JWTProvider defines the JWT provider configuration.
@@ -383,8 +393,27 @@ func (b BackendOptions) toRoute() *envoyroutev3.Route {
 		})
 	}
 
+	var headerMatch []*envoyroutev3.HeaderMatcher
+	if b.HeaderMatcher != nil {
+		headerMatch = []*envoyroutev3.HeaderMatcher{
+			{
+				Name: b.HeaderMatcher.Name,
+				HeaderMatchSpecifier: &envoyroutev3.HeaderMatcher_StringMatch{
+					StringMatch: &envoymatcher.StringMatcher{
+						MatchPattern: &envoymatcher.StringMatcher_SafeRegex{
+							SafeRegex: &envoymatcher.RegexMatcher{
+								Regex: b.HeaderMatcher.Regex,
+							},
+						},
+					},
+				},
+			},
+		}
+	}
+
 	return &envoyroutev3.Route{
 		Match: &envoyroutev3.RouteMatch{
+			Headers: headerMatch,
 			PathSpecifier: &envoyroutev3.RouteMatch_SafeRegex{
 				SafeRegex: &envoymatcher.RegexMatcher{
 					Regex: b.MatchRouteRegex,
