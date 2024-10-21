@@ -5,6 +5,7 @@ go 1.23.2
 require (
 	github.com/envoyproxy/go-control-plane v0.13.1
 	github.com/ghodss/yaml v1.0.0
+	github.com/golang/protobuf v1.5.3
 	github.com/ory/dockertest/v3 v3.11.0
 	google.golang.org/protobuf v1.35.1
 )

@@ -2,6 +2,7 @@ package envoy
 
 import (
 	"fmt"
+	"net/url"
 
 	"github.com/ghodss/yaml"
 
@@ -13,9 +14,11 @@ import (
 	envoylistenerv3 "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	envoyroutev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	envoyheadermutationv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/header_mutation/v3"
+	envoyjwtauthnv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/jwt_authn/v3"
 	envoyrouterv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/router/v3"
 	envoyconfigmanagerv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	envoymatcher "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
+	pbduration "github.com/golang/protobuf/ptypes/duration"
 
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/types/known/anypb"
@@ -59,6 +62,7 @@ type BackendOptions struct {
 	HeaderMutations HeaderMutations
 	// HeaderAmendments allows the addition and removal of headers after a route is matched but before the request is sent to the backend.
 	HeaderAmendments HeaderAmendments
+	TokenAuthConfig  BackendTokenAuthConfig
 	clusterName      string
 	statsPrefix      string
 	listenerName     string
@@ -97,15 +101,76 @@ type HeaderAmendments struct {
 	RemoveHeaders []string
 }
 
+// JWTProvider defines the JWT provider configuration.
+type JWTProvider struct {
+	// Issuer URI of the JWT provider.
+	Issuer string
+	// RemoteJWKsURI is the URI of the JWKs endpoint
+	RemoteJWKsURI RemoteJWKSURI
+	// LocalJWK is the local JWKs.
+	// If provided it is preferred over RemoteJWKsURI.
+	LocalJWKs *string
+}
+
+// RemoteJWKSURI is the configuration for the remote JWKs URI.
+type RemoteJWKSURI struct {
+	// URI is the URI of the remote JWKs endpoint.
+	URI string
+	// Port is the port of the remote JWKs URI.
+	// If not specified, the default port of 443 will be used.
+	Port uint32
+}
+
+// JWTProviders is a map of JWT provider names to JWT providers.
+type JWTProviders map[string]JWTProvider
+
+// TokenAuthConfig is the configuration for token authentication.
+type TokenAuthConfig struct {
+	JWTProviders JWTProviders
+}
+
+// BackendTokenAuthConfig is the per-backend configuration for token authentication.
+type BackendTokenAuthConfig struct {
+	// JWTAuth is the JWT authentication configuration.
+	// If not specified, the JWT authentication will not be enabled.
+	JWTAuth *BackendJWTAuth
+}
+
+// BackendJWTAuth is the per-backend configuration for JWT authentication.
+type BackendJWTAuth struct {
+	// ProviderName is the name of the JWT provider.
+	ProviderName string
+	// Audiences of the JWT provider.
+	// If not specified, the audiences in JWT will not be checked.
+	Audiences []string
+	provider  JWTProvider
+}
+
 // Options is the configuration for the gateway.
 type Options struct {
 	MetricsReadOptions  *BackendOptions
 	MetricsWriteOptions *BackendOptions
+	TokenAuthConfig     *TokenAuthConfig
 }
 
 // BuildOrDie returns raw YAML configuration for envoy proxy or panics if it fails.
 func (opts Options) BuildOrDie() string {
 	var listenerConfigs []*envoylistenerv3.Listener
+
+	if opts.TokenAuthConfig != nil {
+		if opts.TokenAuthConfig.JWTProviders != nil {
+			for _, backend := range []*BackendOptions{opts.MetricsReadOptions, opts.MetricsWriteOptions} {
+				if backend != nil && backend.TokenAuthConfig.JWTAuth != nil {
+					namedJWTProvider := backend.TokenAuthConfig.JWTAuth.ProviderName
+					if jwtProvider, ok := opts.TokenAuthConfig.JWTProviders[namedJWTProvider]; !ok {
+						panic(fmt.Errorf("JWT provider %s not found in token auth config", namedJWTProvider))
+					} else {
+						backend.TokenAuthConfig.JWTAuth.provider = jwtProvider
+					}
+				}
+			}
+		}
+	}
 
 	if opts.MetricsReadOptions != nil {
 		opts.MetricsReadOptions.clusterName = metricsReadClusterName
@@ -134,7 +199,6 @@ func (opts Options) BuildOrDie() string {
 	marshalOpts := protojson.MarshalOptions{Indent: "  "}
 	b, err := marshalOpts.Marshal(bootstrap)
 	if err != nil {
-		fmt.Println(err)
 		panic(err)
 
 	}
@@ -150,6 +214,10 @@ func buildListenerConfig(opts BackendOptions) *envoylistenerv3.Listener {
 	var httpFilters []*envoyconfigmanagerv3.HttpFilter
 	if len(opts.HeaderMutations) > 0 {
 		httpFilters = append(httpFilters, opts.HeaderMutations.toHttpFilter())
+	}
+
+	if opts.TokenAuthConfig.JWTAuth != nil {
+		httpFilters = append(httpFilters, opts.TokenAuthConfig.JWTAuth.toHttpFilter(opts.MatchRouteRegex))
 	}
 
 	connManager := buildHTTPConnectionManager(opts, httpFilters)
@@ -242,6 +310,10 @@ func (opts Options) toClusters() []*envoyconfigclusterv3.Cluster {
 		clusters = append(clusters, opts.MetricsWriteOptions.BackendConfig.toCluster(metricsWriteClusterName))
 	}
 
+	if opts.TokenAuthConfig != nil && len(opts.TokenAuthConfig.JWTProviders) > 0 {
+		clusters = append(clusters, opts.TokenAuthConfig.JWTProviders.toClusters()...)
+	}
+
 	return clusters
 }
 
@@ -250,7 +322,7 @@ func (b Backend) toCluster(name string) *envoyconfigclusterv3.Cluster {
 	if b.Scheme == "" {
 		b.Scheme = "http"
 	}
-	return buildEnvoyCluster(name, "http", b.Address, b.Port, envoyconfigclusterv3.Cluster_LOGICAL_DNS)
+	return buildEnvoyCluster(name, b.Scheme, b.Address, b.Port, envoyconfigclusterv3.Cluster_LOGICAL_DNS)
 }
 
 // buildEnvoyCluster returns the envoy cluster for the backend.
@@ -380,6 +452,91 @@ func (hm HeaderMutations) toHttpFilter() *envoyconfigmanagerv3.HttpFilter {
 			TypedConfig: &anypb.Any{
 				TypeUrl: "type.googleapis.com/envoy.extensions.filters.http.header_mutation.v3.HeaderMutation",
 				Value:   filterPB.GetValue(),
+			},
+		},
+	}
+}
+
+func (jwts JWTProviders) toClusters() []*envoyconfigclusterv3.Cluster {
+	var clusters []*envoyconfigclusterv3.Cluster
+	for name, jwt := range jwts {
+		clusters = append(clusters, jwt.toCluster(name))
+	}
+	return clusters
+}
+
+func (jwt JWTProvider) toCluster(name string) *envoyconfigclusterv3.Cluster {
+	scheme := "https"
+	port := uint32(443)
+	if jwt.RemoteJWKsURI.Port != 0 {
+		port = jwt.RemoteJWKsURI.Port
+	}
+
+	url, err := url.Parse(jwt.RemoteJWKsURI.URI)
+	if err != nil {
+		panic(err)
+	}
+	address := url.Hostname()
+
+	return buildEnvoyCluster(getJWTClusterName(name), scheme, address, port, envoyconfigclusterv3.Cluster_STRICT_DNS)
+}
+
+func getJWTClusterName(name string) string {
+	return fmt.Sprintf("%s_jwt", name)
+}
+
+func (bja BackendJWTAuth) toHttpFilter(matchPrefixRegex string) *envoyconfigmanagerv3.HttpFilter {
+	providerName := getJWTClusterName(bja.ProviderName)
+	rt := &envoyjwtauthnv3.RequirementRule_Requires{
+		Requires: &envoyjwtauthnv3.JwtRequirement{
+			RequiresType: &envoyjwtauthnv3.JwtRequirement_ProviderName{
+				ProviderName: providerName,
+			},
+		},
+	}
+	rr := []*envoyjwtauthnv3.RequirementRule{
+		{
+			RequirementType: rt,
+			Match: &envoyroutev3.RouteMatch{
+				PathSpecifier: &envoyroutev3.RouteMatch_SafeRegex{SafeRegex: &envoymatcher.RegexMatcher{Regex: matchPrefixRegex}},
+			},
+		},
+	}
+
+	auth := &envoyjwtauthnv3.JwtAuthentication{
+		Providers: map[string]*envoyjwtauthnv3.JwtProvider{
+			providerName: {
+				Issuer:    bja.provider.Issuer,
+				Audiences: bja.Audiences,
+				JwksSourceSpecifier: &envoyjwtauthnv3.JwtProvider_RemoteJwks{
+					RemoteJwks: &envoyjwtauthnv3.RemoteJwks{
+						HttpUri: &envoyconfigcorev3.HttpUri{
+							Uri: bja.provider.RemoteJWKsURI.URI,
+							HttpUpstreamType: &envoyconfigcorev3.HttpUri_Cluster{
+								Cluster: providerName,
+							},
+							Timeout: &pbduration.Duration{
+								Seconds: 5,
+							},
+						},
+					},
+				},
+			},
+		},
+		Rules: rr,
+	}
+
+	authPB, err := anypb.New(auth)
+	if err != nil {
+		panic(err)
+	}
+
+	return &envoyconfigmanagerv3.HttpFilter{
+		Name: "envoy.filters.http.jwt_authn",
+		ConfigType: &envoyconfigmanagerv3.HttpFilter_TypedConfig{
+			TypedConfig: &anypb.Any{
+				TypeUrl: "type.googleapis.com/envoy.extensions.filters.http.jwt_authn.v3.JwtAuthentication",
+				Value:   authPB.Value,
 			},
 		},
 	}

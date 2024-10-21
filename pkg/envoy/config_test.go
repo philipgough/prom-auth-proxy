@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/ory/dockertest/v3"
@@ -239,6 +240,73 @@ func TestOpts_HeaderAmendments(t *testing.T) {
 
 	if respBody.Headers[someHeaderToAddAtRouteMatch] != someHeaderToAddAtRouteMatchVal {
 		t.Fatalf("expected header %s to be %s, got %s", someHeaderToAddAtRouteMatch, someHeaderToAddAtRouteMatchVal, respBody.Headers[someHeaderToAddAtRouteMatch])
+	}
+}
+
+func TestOpts_TokenAuth_JWT(t *testing.T) {
+	providerName := "istio_demo"
+	jwtProvider := JWTProvider{
+		Issuer: "testing@secure.istio.io",
+		RemoteJWKsURI: RemoteJWKSURI{
+			URI: "https://raw.githubusercontent.com/istio/istio/release-1.23/security/tools/jwt/samples/jwks.json",
+		},
+	}
+
+	opts := Options{
+		TokenAuthConfig: &TokenAuthConfig{
+			JWTProviders: map[string]JWTProvider{
+				providerName: jwtProvider,
+			},
+		},
+		MetricsReadOptions: &BackendOptions{
+			MatchRouteRegex: testReadPath,
+			BackendConfig: Backend{
+				Address: httpbinName,
+				Port:    httpPort,
+			},
+			TokenAuthConfig: BackendTokenAuthConfig{
+				JWTAuth: &BackendJWTAuth{
+					ProviderName: providerName,
+				},
+			},
+		},
+	}
+	resource := runEnvoy(t, opts.BuildOrDie())
+	port := resource.GetPort(fmt.Sprintf("%d/tcp", MetricsReadListenerPort))
+	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("http://localhost:%s%s", port, testReadPath), nil)
+	if err != nil {
+		t.Fatalf("could not create request: %s", err)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("could not get response: %s", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected status code 401, got %d", resp.StatusCode)
+	}
+
+	req, err = http.NewRequest(http.MethodGet, fmt.Sprintf("http://localhost:%s%s", port, testReadPath), nil)
+	if err != nil {
+		t.Fatalf("could not create request: %s", err)
+	}
+
+	token, err := os.ReadFile("testdata/demo.jwt")
+	if err != nil {
+		t.Fatalf("unable to read file: %v", err)
+	}
+
+	req.Header.Add("Authorization", fmt.Sprintf("Bearer %s", strings.TrimSpace(string(token))))
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("could not get response: %s", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected status code 200, got %d", resp.StatusCode)
 	}
 }
 
