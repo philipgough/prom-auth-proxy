@@ -1,0 +1,19 @@
+{
+  "CN": "test-ca",
+  "hosts": ["localhost"],
+  "key": {
+    "algo": "ecdsa",
+    "size": 256
+  },
+  "names": [
+    {
+      "O": "test-ca",
+      "OU": "testing",
+      "ST": "Tokyo",
+      "C": "JP"
+    }
+  ],
+  "ca": {
+    "expiry": "876000h"
+  }
+}

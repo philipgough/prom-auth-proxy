@@ -22,10 +22,12 @@ import (
 	envoyrbacv3filter "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/rbac/v3"
 	envoyrouterv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/router/v3"
 	envoyconfigmanagerv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
+	envoytlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
 	envoymatcher "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
 
 	"github.com/ghodss/yaml"
 	pbduration "github.com/golang/protobuf/ptypes/duration"
+	"github.com/golang/protobuf/ptypes/wrappers"
 
 	v1alpha1 "google.golang.org/genproto/googleapis/api/expr/v1alpha1"
 	"google.golang.org/protobuf/encoding/protojson"
@@ -77,10 +79,12 @@ type BackendOptions struct {
 	HeaderMatcher *HeaderMatcher
 	// TokenAuthConfig is the configuration for token authentication.
 	TokenAuthConfig BackendTokenAuthConfig
-	clusterName     string
-	statsPrefix     string
-	listenerName    string
-	listenerPort    uint32
+	// MTLSConfig is the configuration for mTLS.
+	MTLSConfig   *MTLSConfig
+	clusterName  string
+	statsPrefix  string
+	listenerName string
+	listenerPort uint32
 }
 
 // HeaderMutation represents a mutation to be applied to HTTP headers.
@@ -174,6 +178,19 @@ type BackendJWTAuth struct {
 	AllowNamedCELPolicies []string
 	provider              JWTProvider
 	attachRBACPolicies    CELPolicies
+}
+
+// MTLSConfig is the configuration for mTLS.
+type MTLSConfig struct {
+	// TrustedCA is the path to the trusted CA certificate.
+	TrustedCA string
+	// ServerCert is the path to the server certificate.
+	ServerCert string
+	// ServerKey is the path to the server key.
+	ServerKey string
+	// MatchSANs is the list of SANs to match.
+	// If not specified, the SANs in the server certificate will not be checked.
+	MatchSANs []string
 }
 
 // Options is the configuration for the gateway.
@@ -277,6 +294,10 @@ func buildListenerConfig(opts BackendOptions) *envoylistenerv3.Listener {
 				},
 			},
 		},
+	}
+
+	if opts.MTLSConfig != nil {
+		filterChains[0].TransportSocket = opts.MTLSConfig.toTransportSocket()
 	}
 
 	listener, err := buildEnvoyListener(opts.listenerName, opts.listenerPort, filterChains)
@@ -670,4 +691,50 @@ func (bja BackendJWTAuth) toHttpFilter(matchPrefixRegex string) []*envoyconfigma
 	}
 
 	return []*envoyconfigmanagerv3.HttpFilter{jwtHTTPFilter, filter}
+}
+
+func (m *MTLSConfig) toTransportSocket() *envoyconfigcorev3.TransportSocket {
+	dt := envoytlsv3.DownstreamTlsContext{
+		RequireClientCertificate: &wrappers.BoolValue{Value: true},
+		CommonTlsContext: &envoytlsv3.CommonTlsContext{
+			TlsCertificates: []*envoytlsv3.TlsCertificate{
+				{
+					CertificateChain: &envoyconfigcorev3.DataSource{
+						Specifier: &envoyconfigcorev3.DataSource_Filename{
+							Filename: m.ServerCert,
+						},
+					},
+					PrivateKey: &envoyconfigcorev3.DataSource{
+						Specifier: &envoyconfigcorev3.DataSource_Filename{
+							Filename: m.ServerKey,
+						},
+					},
+				},
+			},
+			ValidationContextType: &envoytlsv3.CommonTlsContext_ValidationContext{
+				ValidationContext: &envoytlsv3.CertificateValidationContext{
+					TrustedCa: &envoyconfigcorev3.DataSource{
+						Specifier: &envoyconfigcorev3.DataSource_Filename{
+							Filename: m.TrustedCA,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	dtPB, err := anypb.New(&dt)
+	if err != nil {
+		panic(err)
+	}
+
+	return &envoyconfigcorev3.TransportSocket{
+		Name: "envoy.transport_sockets.tls",
+		ConfigType: &envoyconfigcorev3.TransportSocket_TypedConfig{
+			TypedConfig: &anypb.Any{
+				TypeUrl: "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext",
+				Value:   dtPB.GetValue(),
+			},
+		},
+	}
 }
