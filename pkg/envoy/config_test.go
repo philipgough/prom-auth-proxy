@@ -360,6 +360,117 @@ func TestOpts_TokenAuth_JWT(t *testing.T) {
 	}
 }
 
+func TestOpts_TokenAuth_JWT_RBAC(t *testing.T) {
+	providerName := "istio_demo"
+	jwtProvider := JWTProvider{
+		Issuer: "testing@secure.istio.io",
+		RemoteJWKsURI: RemoteJWKSURI{
+			URI: "https://raw.githubusercontent.com/istio/istio/release-1.23/security/tools/jwt/samples/jwks.json",
+		},
+	}
+
+	opts := Options{
+		CELPolicies: CELPolicies{
+			"some-test-policy": "'group1' in token.groups",
+		},
+		TokenAuthConfig: &TokenAuthConfig{
+			JWTProviders: map[string]JWTProvider{
+				providerName: jwtProvider,
+			},
+		},
+		MetricsReadOptions: &BackendOptions{
+			MatchRouteRegex: testReadPath,
+			BackendConfig: Backend{
+				Address: httpbinName,
+				Port:    httpPort,
+			},
+			TokenAuthConfig: BackendTokenAuthConfig{
+				JWTAuth: &BackendJWTAuth{
+					ProviderName:          providerName,
+					AllowNamedCELPolicies: []string{"some-test-policy"},
+				},
+			},
+		},
+	}
+	resource := runEnvoy(t, opts.BuildOrDie())
+	port := resource.GetPort(fmt.Sprintf("%d/tcp", MetricsReadListenerPort))
+	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("http://localhost:%s%s", port, testReadPath), nil)
+	if err != nil {
+		t.Fatalf("could not create request: %s", err)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("could not get response: %s", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected status code 401, got %d", resp.StatusCode)
+	}
+
+	req, err = http.NewRequest(http.MethodGet, fmt.Sprintf("http://localhost:%s%s", port, testReadPath), nil)
+	if err != nil {
+		t.Fatalf("could not create request: %s", err)
+	}
+
+	// This token decodes as follows:
+	// {
+	//  "exp": 4685989700,
+	//  "foo": "bar",
+	//  "iat": 1532389700,
+	//  "iss": "testing@secure.istio.io",
+	//  "sub": "testing@secure.istio.io"
+	// }
+
+	token, err := os.ReadFile("testdata/demo.jwt")
+	if err != nil {
+		t.Fatalf("unable to read file: %v", err)
+	}
+
+	req.Header.Add("Authorization", fmt.Sprintf("Bearer %s", strings.TrimSpace(string(token))))
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("could not get response: %s", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected status code 403, got %d", resp.StatusCode)
+	}
+	req.Header.Del("Authorization")
+
+	// This token decodes as follows:
+	// {
+	//  "exp": 3537391104,
+	//  "groups": [
+	//    "group1",
+	//    "group2"
+	//  ],
+	//  "iat": 1537391104,
+	//  "iss": "testing@secure.istio.io",
+	//  "scope": [
+	//    "scope1",
+	//    "scope2"
+	//  ],
+	//  "sub": "testing@secure.istio.io"
+	// }
+	groupsToken, err := os.ReadFile("testdata/group-scopes.jwt")
+	if err != nil {
+		t.Fatalf("unable to read file: %v", err)
+	}
+	req.Header.Add("Authorization", fmt.Sprintf("Bearer %s", strings.TrimSpace(string(groupsToken))))
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("could not get response: %s", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected status code 200, got %d", resp.StatusCode)
+	}
+}
+
 func runEnvoy(t *testing.T, withConfig string) *dockertest.Resource {
 	t.Helper()
 	dir := t.TempDir()

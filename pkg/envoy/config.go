@@ -3,8 +3,11 @@ package envoy
 import (
 	"fmt"
 	"net/url"
+	"strings"
 
-	"github.com/ghodss/yaml"
+	"github.com/google/cel-go/common"
+	"github.com/google/cel-go/common/ast"
+	"github.com/google/cel-go/parser"
 
 	envoyconfigbootstrapv3 "github.com/envoyproxy/go-control-plane/envoy/config/bootstrap/v3"
 	envoyconfigclusterv3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
@@ -12,14 +15,19 @@ import (
 	envoyconfigcorev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	envoyendpointv3 "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
 	envoylistenerv3 "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
+	rbacv3 "github.com/envoyproxy/go-control-plane/envoy/config/rbac/v3"
 	envoyroutev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	envoyheadermutationv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/header_mutation/v3"
 	envoyjwtauthnv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/jwt_authn/v3"
+	envoyrbacv3filter "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/rbac/v3"
 	envoyrouterv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/router/v3"
 	envoyconfigmanagerv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	envoymatcher "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
+
+	"github.com/ghodss/yaml"
 	pbduration "github.com/golang/protobuf/ptypes/duration"
 
+	v1alpha1 "google.golang.org/genproto/googleapis/api/expr/v1alpha1"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/types/known/anypb"
 )
@@ -38,6 +46,9 @@ const (
 	envoyWriteListenerName   = "metrics_write_http_listener"
 	MetricsWriteListenerPort = 8081
 	metricsWriteStatsPrefix  = "metrics_write_http"
+
+	tokenMetadataKey       = "token"
+	tokenInMetadataPathJWT = "metadata.filter_metadata['envoy.filters.http.jwt_authn'].token."
 )
 
 // Backend represents a backend service that the proxy will route traffic to.
@@ -146,6 +157,9 @@ type BackendTokenAuthConfig struct {
 	JWTAuth *BackendJWTAuth
 }
 
+// CELPolicies is the map of named CEL policies to CEL expressions.
+type CELPolicies map[string]string
+
 // BackendJWTAuth is the per-backend configuration for JWT authentication.
 type BackendJWTAuth struct {
 	// ProviderName is the name of the JWT provider.
@@ -153,7 +167,13 @@ type BackendJWTAuth struct {
 	// Audiences of the JWT provider.
 	// If not specified, the audiences in JWT will not be checked.
 	Audiences []string
-	provider  JWTProvider
+	// AllowNamedCELPolicies is the list of named CEL expressions for RBAC.
+	// If not specified, the RBAC will not be checked.
+	// If any of the expressions evaluate to true, the request will be allowed.
+	// If all the expressions evaluate to false, the request will be denied.
+	AllowNamedCELPolicies []string
+	provider              JWTProvider
+	attachRBACPolicies    CELPolicies
 }
 
 // Options is the configuration for the gateway.
@@ -161,6 +181,7 @@ type Options struct {
 	MetricsReadOptions  *BackendOptions
 	MetricsWriteOptions *BackendOptions
 	TokenAuthConfig     *TokenAuthConfig
+	CELPolicies         CELPolicies
 }
 
 // BuildOrDie returns raw YAML configuration for envoy proxy or panics if it fails.
@@ -177,6 +198,15 @@ func (opts Options) BuildOrDie() string {
 					} else {
 						backend.TokenAuthConfig.JWTAuth.provider = jwtProvider
 					}
+
+					attachPolicies := make(CELPolicies, len(backend.TokenAuthConfig.JWTAuth.AllowNamedCELPolicies))
+					for _, policy := range backend.TokenAuthConfig.JWTAuth.AllowNamedCELPolicies {
+						if _, ok := opts.CELPolicies[policy]; !ok {
+							panic(fmt.Errorf("CEL policy %s not found in CEL policies", policy))
+						}
+						attachPolicies[policy] = opts.CELPolicies[policy]
+					}
+					backend.TokenAuthConfig.JWTAuth.attachRBACPolicies = attachPolicies
 				}
 			}
 		}
@@ -227,7 +257,7 @@ func buildListenerConfig(opts BackendOptions) *envoylistenerv3.Listener {
 	}
 
 	if opts.TokenAuthConfig.JWTAuth != nil {
-		httpFilters = append(httpFilters, opts.TokenAuthConfig.JWTAuth.toHttpFilter(opts.MatchRouteRegex))
+		httpFilters = append(httpFilters, opts.TokenAuthConfig.JWTAuth.toHttpFilter(opts.MatchRouteRegex)...)
 	}
 
 	connManager := buildHTTPConnectionManager(opts, httpFilters)
@@ -514,7 +544,7 @@ func getJWTClusterName(name string) string {
 	return fmt.Sprintf("%s_jwt", name)
 }
 
-func (bja BackendJWTAuth) toHttpFilter(matchPrefixRegex string) *envoyconfigmanagerv3.HttpFilter {
+func (bja BackendJWTAuth) toHttpFilter(matchPrefixRegex string) []*envoyconfigmanagerv3.HttpFilter {
 	providerName := getJWTClusterName(bja.ProviderName)
 	rt := &envoyjwtauthnv3.RequirementRule_Requires{
 		Requires: &envoyjwtauthnv3.JwtRequirement{
@@ -535,8 +565,9 @@ func (bja BackendJWTAuth) toHttpFilter(matchPrefixRegex string) *envoyconfigmana
 	auth := &envoyjwtauthnv3.JwtAuthentication{
 		Providers: map[string]*envoyjwtauthnv3.JwtProvider{
 			providerName: {
-				Issuer:    bja.provider.Issuer,
-				Audiences: bja.Audiences,
+				Issuer:            bja.provider.Issuer,
+				Audiences:         bja.Audiences,
+				PayloadInMetadata: tokenMetadataKey,
 				JwksSourceSpecifier: &envoyjwtauthnv3.JwtProvider_RemoteJwks{
 					RemoteJwks: &envoyjwtauthnv3.RemoteJwks{
 						HttpUri: &envoyconfigcorev3.HttpUri{
@@ -560,7 +591,7 @@ func (bja BackendJWTAuth) toHttpFilter(matchPrefixRegex string) *envoyconfigmana
 		panic(err)
 	}
 
-	return &envoyconfigmanagerv3.HttpFilter{
+	jwtHTTPFilter := &envoyconfigmanagerv3.HttpFilter{
 		Name: "envoy.filters.http.jwt_authn",
 		ConfigType: &envoyconfigmanagerv3.HttpFilter_TypedConfig{
 			TypedConfig: &anypb.Any{
@@ -569,4 +600,74 @@ func (bja BackendJWTAuth) toHttpFilter(matchPrefixRegex string) *envoyconfigmana
 			},
 		},
 	}
+
+	if len(bja.attachRBACPolicies) == 0 {
+		return []*envoyconfigmanagerv3.HttpFilter{jwtHTTPFilter}
+	}
+
+	p, err := parser.NewParser()
+	if err != nil {
+		panic(err)
+	}
+
+	policies := make(map[string]*rbacv3.Policy)
+	for k, expr := range bja.attachRBACPolicies {
+		expr = strings.Replace(expr, "token.", tokenInMetadataPathJWT, -1)
+		ss := common.NewStringSource(expr, k)
+		parsedAST, issues := p.Parse(ss)
+		if issues != nil && len(issues.GetErrors()) > 0 {
+			panic(fmt.Errorf("failed to parse CEL expression: %v", issues.GetErrors()))
+		}
+
+		a, err := ast.ToProto(parsedAST)
+		if err != nil {
+			panic(fmt.Errorf("failed to convert AST to proto: %v", err))
+		}
+
+		policy := &rbacv3.Policy{
+			Permissions: []*rbacv3.Permission{
+				{
+					Rule: &rbacv3.Permission_Any{
+						Any: true,
+					},
+				},
+			},
+			Principals: []*rbacv3.Principal{
+				{
+					Identifier: &rbacv3.Principal_Any{
+						Any: true,
+					},
+				},
+			},
+			Condition: &v1alpha1.Expr{
+				Id:       1,
+				ExprKind: a.Expr.ExprKind,
+			},
+		}
+		policies[k] = policy
+	}
+
+	rbac := envoyrbacv3filter.RBAC{
+		Rules: &rbacv3.RBAC{
+			Action:   rbacv3.RBAC_ALLOW,
+			Policies: policies,
+		},
+	}
+
+	rbacPB, err := anypb.New(&rbac)
+	if err != nil {
+		panic(err)
+	}
+
+	filter := &envoyconfigmanagerv3.HttpFilter{
+		Name: "envoy.filters.http.rbac",
+		ConfigType: &envoyconfigmanagerv3.HttpFilter_TypedConfig{
+			TypedConfig: &anypb.Any{
+				TypeUrl: "type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBAC",
+				Value:   rbacPB.GetValue(),
+			},
+		},
+	}
+
+	return []*envoyconfigmanagerv3.HttpFilter{jwtHTTPFilter, filter}
 }
