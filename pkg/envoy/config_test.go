@@ -388,15 +388,15 @@ func TestOpts_TokenAuth_JWT_RBAC(t *testing.T) {
 			},
 		},
 		MetricsReadOptions: &BackendOptions{
-			MatchRouteRegex: testReadPath,
+			NamedCELRBACPolicies: []string{"some-test-policy"},
+			MatchRouteRegex:      testReadPath,
 			BackendConfig: Backend{
 				Address: httpbinName,
 				Port:    httpPort,
 			},
 			TokenAuthConfig: BackendTokenAuthConfig{
 				JWTAuth: &BackendJWTAuth{
-					ProviderName:          providerName,
-					AllowNamedCELPolicies: []string{"some-test-policy"},
+					ProviderName: providerName,
 				},
 			},
 		},
@@ -558,6 +558,114 @@ func TestOpts_MTLS(t *testing.T) {
 	if expectOkResp.StatusCode != http.StatusOK {
 		t.Fatalf("expected status code 200, got %d", expectOkResp.StatusCode)
 	}
+}
+
+func TestOpts_MTLS_RBAC(t *testing.T) {
+	rbacPolicy := "some-test-policy"
+	opts := Options{
+		CELPolicies: CELPolicies{
+			rbacPolicy: "!connection.subject_peer_certificate.contains('client')",
+		},
+		MetricsReadOptions: &BackendOptions{
+			MatchRouteRegex: testReadPath,
+			BackendConfig: Backend{
+				Address: httpbinName,
+				Port:    httpPort,
+			},
+		},
+		MetricsWriteOptions: &BackendOptions{
+			BackendConfig: Backend{
+				Address: httpbinName,
+				Port:    httpPort,
+			},
+			MatchRouteRegex: testWritePath,
+			MTLSConfig: &MTLSConfig{
+				TrustedCA:  caFilePath,
+				ServerCert: certPath,
+				ServerKey:  keyPath,
+			},
+			NamedCELRBACPolicies: []string{rbacPolicy},
+		},
+	}
+	resource := runEnvoy(t, opts.BuildOrDie())
+	port := resource.GetPort(fmt.Sprintf("%d/tcp", MetricsReadListenerPort))
+	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("http://localhost:%s%s", port, testReadPath), nil)
+	if err != nil {
+		t.Fatalf("could not create request: %s", err)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("could not get response: %s", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected status code 200, got %d", resp.StatusCode)
+	}
+
+	port = resource.GetPort(fmt.Sprintf("%d/tcp", MetricsWriteListenerPort))
+	req, err = http.NewRequest(http.MethodGet, fmt.Sprintf("https://localhost:%s%s", port, testWritePath), nil)
+	if err != nil {
+		t.Fatalf("could not create request: %s", err)
+	}
+
+	resp, mtlsErr := http.DefaultClient.Do(req)
+	if mtlsErr == nil {
+		t.Fatalf("expected error, got none")
+	}
+
+	caCert, err := os.ReadFile("testdata/certs/ca.pem")
+	if err != nil {
+		t.Fatalf("could not read ca cert: %s", err)
+	}
+	caCertPool := x509.NewCertPool()
+	caCertPool.AppendCertsFromPEM(caCert)
+
+	cert, err := tls.LoadX509KeyPair("testdata/certs/client.pem", "testdata/certs/client-key.pem")
+	if err != nil {
+		t.Fatalf("could not load client cert: %s", err)
+	}
+
+	client := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				RootCAs:      caCertPool,
+				Certificates: []tls.Certificate{cert},
+			},
+		},
+	}
+	response, expectErr := client.Do(req)
+	if expectErr != nil {
+		t.Fatalf("expected no error, got %s", expectErr)
+	}
+
+	if response.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected status code 403, got %d", response.StatusCode)
+	}
+
+	secondCert, err := tls.LoadX509KeyPair("testdata/certs/second-client.pem", "testdata/certs/second-client-key.pem")
+	if err != nil {
+		t.Fatalf("could not load client cert: %s", err)
+	}
+
+	client = &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				RootCAs:      caCertPool,
+				Certificates: []tls.Certificate{secondCert},
+			},
+		},
+	}
+	expectOkRep, expectNoErr := client.Do(req)
+	if expectNoErr != nil {
+		t.Fatalf("expected no error, got %s", expectNoErr)
+	}
+
+	if expectOkRep.StatusCode != http.StatusOK {
+		t.Fatalf("expected status code 200, got %d", expectOkRep.StatusCode)
+	}
+
 }
 
 // runEnvoy starts an envoy container with the provided config and returns the resource
