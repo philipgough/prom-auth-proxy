@@ -2,6 +2,7 @@ package lbac
 
 import (
 	"fmt"
+	"github.com/prometheus-community/prom-label-proxy/injectproxy"
 
 	"github.com/ghodss/yaml"
 	"github.com/philipgough/prom-auth-proxy/pkg/cel"
@@ -53,6 +54,46 @@ type RawSelector struct {
 // Evaluate evaluates the policy against the source.
 func (p Policy) Evaluate(againstState map[string]any) (bool, error) {
 	return cel.EvalMap(p.CELExpression, againstState)
+}
+
+// Apply applies the policy to the expression.
+func (p Policy) Apply(expr parser.Expr) error {
+	for _, selector := range p.Selectors {
+		enforcer := injectproxy.NewPromQLEnforcer(false, selector.LabelSelector...)
+		if selector.ConditionalSelector == nil {
+			return enforcer.EnforceNode(expr)
+		}
+
+		var matchedConditions int
+		var err error
+		var done bool
+		parser.Inspect(expr, func(node parser.Node, path []parser.Node) error {
+			if n, ok := node.(*parser.VectorSelector); ok {
+				for _, label := range n.LabelMatchers {
+					for _, cond := range selector.ConditionalSelector {
+						if cond.String() == label.String() {
+							matchedConditions++
+						}
+					}
+				}
+				if matchedConditions == len(selector.ConditionalSelector) {
+					done = true
+
+					n.LabelMatchers, err = enforcer.EnforceMatchers(n.LabelMatchers)
+					return err
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		if done {
+			return nil
+		}
+
+	}
+	return nil
 }
 
 // RawPolicy is a list of CEL expressions and matchers in string form.

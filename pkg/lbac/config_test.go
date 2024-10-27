@@ -1,9 +1,11 @@
 package lbac
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/promql/parser"
 )
 
 func TestRawPolicyToPolicy(t *testing.T) {
@@ -193,6 +195,76 @@ func TestEvaluate(t *testing.T) {
 			if result != tt.wantResult {
 				t.Errorf("Evaluate() result = %v, want %v", result, tt.wantResult)
 			}
+		})
+	}
+}
+
+func TestApplyPolicy(t *testing.T) {
+	tests := []struct {
+		name    string
+		policy  Policy
+		expr    string
+		wantErr bool
+		expect  string
+	}{
+		{
+			name: "ValidPolicyWithoutConditionalSelector",
+			policy: Policy{
+				Selectors: []Selector{
+					{
+						LabelSelector: []*labels.Matcher{
+							{Type: labels.MatchEqual, Name: "foo", Value: "bar"},
+						},
+					},
+				},
+			},
+			expr:    `up{test="test"}`,
+			expect:  `up{foo="bar",test="test"}`,
+			wantErr: false,
+		},
+		{
+			name: "ValidPolicyWithConditionalSelector",
+			policy: Policy{
+				Selectors: []Selector{
+					{
+						LabelSelector: []*labels.Matcher{
+							{Type: labels.MatchEqual, Name: "foo", Value: "bar"},
+						},
+						ConditionalSelector: []*labels.Matcher{
+							{Type: labels.MatchEqual, Name: "baz", Value: "qux"},
+						},
+					},
+					{
+						LabelSelector: []*labels.Matcher{
+							{Type: labels.MatchEqual, Name: "some", Value: "value"},
+						},
+						ConditionalSelector: []*labels.Matcher{
+							{Type: labels.MatchEqual, Name: "__name__", Value: "up"},
+						},
+					},
+					{
+						LabelSelector: []*labels.Matcher{
+							{Type: labels.MatchEqual, Name: "expect", Value: "skip"},
+						},
+					},
+				},
+			},
+			expr:    `up{some="value",test="test"}`,
+			wantErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			parsedExpr, err := parser.ParseExpr(tt.expr)
+			if err != nil {
+				t.Fatalf(err.Error())
+			}
+			err = tt.policy.Apply(parsedExpr)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("Apply() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			fmt.Println(parsedExpr.String())
 		})
 	}
 }
