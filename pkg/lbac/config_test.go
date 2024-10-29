@@ -268,3 +268,32 @@ func TestApplyPolicy(t *testing.T) {
 		})
 	}
 }
+
+func TestRawPolicyToFilterMetadata(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   []byte
+		wantErr bool
+	}{
+		{
+			name: "ValidInput",
+			input: []byte(`
+policies:
+  - name: policy1
+    expression: "request.method == 'GET'"
+    selectors:
+      - label_selector: "{foo='bar'}"
+`),
+			wantErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := RawPolicyToFilterMetadata(tt.input)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("RawPolicyToFilterMetadata() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}

@@ -2,12 +2,13 @@ package lbac
 
 import (
 	"fmt"
-	"github.com/prometheus-community/prom-label-proxy/injectproxy"
 
 	"github.com/ghodss/yaml"
 	"github.com/philipgough/prom-auth-proxy/pkg/cel"
+	"github.com/prometheus-community/prom-label-proxy/injectproxy"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql/parser"
+	"google.golang.org/protobuf/types/known/structpb"
 )
 
 const (
@@ -156,4 +157,19 @@ func RawPolicyToPolicy(b []byte) (Policies, error) {
 	}
 
 	return lbacPolicies, nil
+}
+
+// RawPolicyToFilterMetadata converts a raw policy to a filter metadata.
+func RawPolicyToFilterMetadata(b []byte) (*structpb.Value, error) {
+	var rawPolicies []any
+	err := yaml.Unmarshal(b, &rawPolicies)
+	if err != nil {
+		return nil, err
+	}
+
+	v, err := structpb.NewValue(rawPolicies)
+	if err != nil {
+		return nil, err
+	}
+	return v, nil
 }
