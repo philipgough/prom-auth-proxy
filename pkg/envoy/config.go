@@ -13,41 +13,44 @@ import (
 	envoylistenerv3 "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	rbacv3 "github.com/envoyproxy/go-control-plane/envoy/config/rbac/v3"
 	envoyroutev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+	envoyextprocv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_proc/v3"
 	envoyheadermutationv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/header_mutation/v3"
 	envoyjwtauthnv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/jwt_authn/v3"
 	envoyrbacv3filter "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/rbac/v3"
 	envoyrouterv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/router/v3"
+	envoysetmetadatav3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/set_metadata/v3"
 	envoyconfigmanagerv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	envoytlsv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
 	envoymatcher "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
 
-	"github.com/google/cel-go/common"
-	"github.com/google/cel-go/common/ast"
-	"github.com/google/cel-go/parser"
-
 	"github.com/ghodss/yaml"
 	pbduration "github.com/golang/protobuf/ptypes/duration"
 	"github.com/golang/protobuf/ptypes/wrappers"
+	"github.com/philipgough/prom-auth-proxy/pkg/cel"
+	"github.com/philipgough/prom-auth-proxy/pkg/lbac"
 
 	v1alpha1 "google.golang.org/genproto/googleapis/api/expr/v1alpha1"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/types/known/anypb"
+	"google.golang.org/protobuf/types/known/structpb"
 )
 
 const (
-	metricsReadClusterName  = "metrics_read"
-	metricsWriteClusterName = "metrics_write"
+	signalReadClusterName  = "read"
+	signalWriteClusterName = "write"
 
 	envoyListenerAddress = "0.0.0.0"
 	AdminPort            = 9901
 
-	metricsReadListenerName = "metrics_read_http_listener"
-	MetricsReadListenerPort = 8080
-	metricsReadStatsPrefix  = "metrics_read_http"
+	readListenerName = "read_http_listener"
+	ReadListenerPort = 8080
+	readStatsPrefix  = "read_http"
 
-	envoyWriteListenerName   = "metrics_write_http_listener"
-	MetricsWriteListenerPort = 8081
-	metricsWriteStatsPrefix  = "metrics_write_http"
+	writeListenerName = "write_http_listener"
+	WriteListenerPort = 8081
+	writeStatsPrefix  = "write_http"
+
+	jwtFilterName = "envoy.filters.http.jwt_authn"
 
 	tokenMetadataKey       = "token"
 	tokenInMetadataPathJWT = "metadata.filter_metadata['envoy.filters.http.jwt_authn'].token."
@@ -62,6 +65,16 @@ type Backend struct {
 	// Scheme is the scheme of the backend service.
 	// If empty, the scheme will be http.
 	Scheme string
+}
+
+type ReadBackend struct {
+	BackendOptions
+	// LBACPolicies is the list of named CEL policies for label based access control.
+	LBACPolicies []lbac.RawPolicy
+}
+
+type WriteBackend struct {
+	BackendOptions
 }
 
 // BackendOptions is the configuration for the backend service.
@@ -102,6 +115,7 @@ type HeaderMutation struct {
 	FromValue fmt.Stringer
 }
 
+// HeaderMutations is a list of HeaderMutation.
 type HeaderMutations []HeaderMutation
 
 // ExistingHeaderMutation represents a mutation that extracts a value from an existing HTTP request header.
@@ -193,11 +207,21 @@ type MTLSConfig struct {
 	MatchSANs []string
 }
 
+// LBACServerConfig is the configuration for the label-based access control server.
+// This is a server that implements the ExternalProcessor interface.
+type LBACServerConfig struct {
+	// Address is the address to listen on for requests.
+	Address string
+	// Port is the port to listen on for gRPC requests.
+	GrpcPort uint32
+}
+
 // Options is the configuration for the gateway.
 type Options struct {
-	MetricsReadOptions  *BackendOptions
-	MetricsWriteOptions *BackendOptions
+	MetricsReadOptions  *ReadBackend
+	MetricsWriteOptions *WriteBackend
 	TokenAuthConfig     *TokenAuthConfig
+	LBACServer          *LBACServerConfig
 	CELPolicies         CELPolicies
 }
 
@@ -234,19 +258,19 @@ func (opts Options) BuildOrDie() string {
 	}
 
 	if opts.MetricsReadOptions != nil {
-		opts.MetricsReadOptions.clusterName = metricsReadClusterName
-		opts.MetricsReadOptions.listenerName = metricsReadListenerName
-		opts.MetricsReadOptions.listenerPort = MetricsReadListenerPort
-		opts.MetricsReadOptions.statsPrefix = metricsReadStatsPrefix
+		opts.MetricsReadOptions.clusterName = signalReadClusterName
+		opts.MetricsReadOptions.listenerName = readListenerName
+		opts.MetricsReadOptions.listenerPort = ReadListenerPort
+		opts.MetricsReadOptions.statsPrefix = readStatsPrefix
 		attachRBACPoliciesOrDie(opts.MetricsReadOptions)
 		listenerConfigs = append(listenerConfigs, buildListenerConfig(*opts.MetricsReadOptions))
 	}
 
 	if opts.MetricsWriteOptions != nil {
-		opts.MetricsWriteOptions.clusterName = metricsWriteClusterName
-		opts.MetricsWriteOptions.listenerName = envoyWriteListenerName
-		opts.MetricsWriteOptions.listenerPort = MetricsWriteListenerPort
-		opts.MetricsWriteOptions.statsPrefix = metricsWriteStatsPrefix
+		opts.MetricsWriteOptions.clusterName = signalWriteClusterName
+		opts.MetricsWriteOptions.listenerName = writeListenerName
+		opts.MetricsWriteOptions.listenerPort = WriteListenerPort
+		opts.MetricsWriteOptions.statsPrefix = writeStatsPrefix
 		attachRBACPoliciesOrDie(opts.MetricsWriteOptions)
 		listenerConfigs = append(listenerConfigs, buildListenerConfig(*opts.MetricsWriteOptions))
 	}
@@ -275,16 +299,23 @@ func (opts Options) BuildOrDie() string {
 
 func buildListenerConfig(opts BackendOptions) *envoylistenerv3.Listener {
 	var httpFilters []*envoyconfigmanagerv3.HttpFilter
+	var forwardingNamespacedMetadata string
+
 	if len(opts.HeaderMutations) > 0 {
 		httpFilters = append(httpFilters, opts.HeaderMutations.toHttpFilter())
 	}
 
 	if opts.TokenAuthConfig.JWTAuth != nil {
+		forwardingNamespacedMetadata = jwtFilterName
 		httpFilters = append(httpFilters, opts.TokenAuthConfig.JWTAuth.toHttpFilter(opts.MatchRouteRegex))
 	}
 
 	if len(opts.attachedRBACPolicies) > 0 {
 		httpFilters = append(httpFilters, opts.attachedRBACPolicies.toHttpFilter())
+	}
+
+	if len(opts.LBACPolicies) > 0 {
+		httpFilters = append(httpFilters, lbacTOHttpFilters(opts.LBACPolicies, forwardingNamespacedMetadata)...)
 	}
 
 	connManager := buildHTTPConnectionManager(opts, httpFilters)
@@ -374,15 +405,19 @@ func buildHTTPConnectionManager(opts BackendOptions, httpFilters []*envoyconfigm
 func (opts Options) toClusters() []*envoyconfigclusterv3.Cluster {
 	var clusters []*envoyconfigclusterv3.Cluster
 	if opts.MetricsReadOptions != nil {
-		clusters = append(clusters, opts.MetricsReadOptions.BackendConfig.toCluster(metricsReadClusterName))
+		clusters = append(clusters, opts.MetricsReadOptions.BackendConfig.toCluster(signalReadClusterName))
 	}
 
 	if opts.MetricsWriteOptions != nil {
-		clusters = append(clusters, opts.MetricsWriteOptions.BackendConfig.toCluster(metricsWriteClusterName))
+		clusters = append(clusters, opts.MetricsWriteOptions.BackendConfig.toCluster(signalWriteClusterName))
 	}
 
 	if opts.TokenAuthConfig != nil && len(opts.TokenAuthConfig.JWTProviders) > 0 {
 		clusters = append(clusters, opts.TokenAuthConfig.JWTProviders.toClusters()...)
+	}
+
+	if opts.LBACServer != nil {
+		clusters = append(clusters, opts.LBACServer.toCluster())
 	}
 
 	return clusters
@@ -429,12 +464,17 @@ func buildEnvoyCluster(name string, scheme, address string, port uint32, discove
 		},
 	}
 	if scheme == "https" {
+		tlsC, err := anypb.New(&envoytlsv3.UpstreamTlsContext{
+			Sni: address,
+		})
+		if err != nil {
+			panic(err)
+		}
+
 		cluster.TransportSocket = &envoyconfigcorev3.TransportSocket{
 			Name: "envoy.transport_sockets.tls",
 			ConfigType: &envoyconfigcorev3.TransportSocket_TypedConfig{
-				TypedConfig: &anypb.Any{
-					TypeUrl: "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext",
-				},
+				TypedConfig: tlsC,
 			},
 		}
 	}
@@ -575,6 +615,26 @@ func getJWTClusterName(name string) string {
 	return fmt.Sprintf("%s_jwt", name)
 }
 
+func (l *LBACServerConfig) toCluster() *envoyconfigclusterv3.Cluster {
+	if l == nil {
+		return nil
+	}
+	// we set this here because we expect this typically to run as a sidecar with envoy
+	address := "localhost"
+	if l.Address != "" {
+		address = l.Address
+	}
+
+	port := uint32(lbac.ServerDefaultPort)
+	if l.GrpcPort != 0 {
+		port = l.GrpcPort
+	}
+
+	c := buildEnvoyCluster(lbac.ServerName, "http", address, port, envoyconfigclusterv3.Cluster_STRICT_DNS)
+	c.Http2ProtocolOptions = &envoyconfigcorev3.Http2ProtocolOptions{}
+	return c
+}
+
 func (bja BackendJWTAuth) toHttpFilter(matchPrefixRegex string) *envoyconfigmanagerv3.HttpFilter {
 	providerName := getJWTClusterName(bja.ProviderName)
 	rt := &envoyjwtauthnv3.RequirementRule_Requires{
@@ -623,7 +683,7 @@ func (bja BackendJWTAuth) toHttpFilter(matchPrefixRegex string) *envoyconfigmana
 	}
 
 	jwtHTTPFilter := &envoyconfigmanagerv3.HttpFilter{
-		Name: "envoy.filters.http.jwt_authn",
+		Name: jwtFilterName,
 		ConfigType: &envoyconfigmanagerv3.HttpFilter_TypedConfig{
 			TypedConfig: &anypb.Any{
 				TypeUrl: "type.googleapis.com/envoy.extensions.filters.http.jwt_authn.v3.JwtAuthentication",
@@ -639,23 +699,18 @@ func (c CELPolicies) toHttpFilter() *envoyconfigmanagerv3.HttpFilter {
 		return nil
 	}
 
-	p, err := parser.NewParser()
-	if err != nil {
-		panic(err)
-	}
-
 	policies := make(map[string]*rbacv3.Policy)
 	for k, expr := range c {
 		expr = strings.Replace(expr, "token.", tokenInMetadataPathJWT, -1)
-		ss := common.NewStringSource(expr, k)
-		parsedAST, issues := p.Parse(ss)
-		if issues != nil && len(issues.GetErrors()) > 0 {
-			panic(fmt.Errorf("failed to parse CEL expression: %v", issues.GetErrors()))
+
+		parsedAST, err := cel.Parse(expr, k)
+		if err != nil {
+			panic(fmt.Errorf("failed to parse CEL expression: %v", err))
 		}
 
-		a, err := ast.ToProto(parsedAST)
+		a, err := cel.ToProto(parsedAST)
 		if err != nil {
-			panic(fmt.Errorf("failed to convert AST to proto: %v", err))
+			panic(fmt.Errorf("failed to convert CEL expression to proto: %v", err))
 		}
 
 		policy := &rbacv3.Policy{
@@ -704,6 +759,127 @@ func (c CELPolicies) toHttpFilter() *envoyconfigmanagerv3.HttpFilter {
 	}
 
 	return filter
+}
+
+func lbacTOHttpFilters(policies []lbac.RawPolicy, withNamespacedMetadata string) []*envoyconfigmanagerv3.HttpFilter {
+	if len(policies) == 0 {
+		return nil
+	}
+	return []*envoyconfigmanagerv3.HttpFilter{
+		lbacToSetMetadataFilter(policies, withNamespacedMetadata),
+		lbacToExtProcFilter(withNamespacedMetadata),
+	}
+}
+
+func lbacToSetMetadataFilter(policies []lbac.RawPolicy, withNamespacedMetadata string) *envoyconfigmanagerv3.HttpFilter {
+	if len(policies) == 0 {
+		return nil
+	}
+
+	raw, err := yaml.Marshal(policies)
+	if err != nil {
+		panic(err)
+	}
+
+	convertedPolicies, err := lbac.RawPolicyToFilterMetadata(raw)
+	if err != nil {
+		panic(err)
+	}
+
+	state := &structpb.Value{
+		Kind: &structpb.Value_StructValue{
+			StructValue: &structpb.Struct{
+				Fields: map[string]*structpb.Value{
+					lbac.DefaultStateKey: {
+						Kind: &structpb.Value_StringValue{
+							StringValue: tokenMetadataKey,
+						},
+					},
+					lbac.DefaultStateNamespace: {
+						Kind: &structpb.Value_StringValue{
+							StringValue: withNamespacedMetadata,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	fields := map[string]*structpb.Value{
+		lbac.DefaultPolicySubKey: convertedPolicies,
+		lbac.DefaultStateSubKey:  state,
+	}
+
+	policyAsMetadata := envoysetmetadatav3.Config{
+		Metadata: []*envoysetmetadatav3.Metadata{
+			{
+				MetadataNamespace: lbac.DefaultMetadataNamespace,
+				AllowOverwrite:    true,
+				Value: &structpb.Struct{
+					Fields: fields,
+				},
+			},
+		},
+	}
+
+	policyMetadataPB, err := anypb.New(&policyAsMetadata)
+	if err != nil {
+		panic(err)
+	}
+
+	return &envoyconfigmanagerv3.HttpFilter{
+		Name: "envoy.filters.http.set_metadata",
+		ConfigType: &envoyconfigmanagerv3.HttpFilter_TypedConfig{
+			TypedConfig: &anypb.Any{
+				TypeUrl: "type.googleapis.com/envoy.extensions.filters.http.set_metadata.v3.Config",
+				Value:   policyMetadataPB.GetValue(),
+			},
+		},
+	}
+}
+
+func lbacToExtProcFilter(withNamespacedMetadata string) *envoyconfigmanagerv3.HttpFilter {
+	metaDataFrom := append([]string{lbac.DefaultMetadataNamespace}, withNamespacedMetadata)
+	extProc := envoyextprocv3.ExternalProcessor{
+		GrpcService: &envoyconfigcorev3.GrpcService{
+			TargetSpecifier: &envoyconfigcorev3.GrpcService_EnvoyGrpc_{
+				EnvoyGrpc: &envoyconfigcorev3.GrpcService_EnvoyGrpc{
+					ClusterName: lbac.ServerName,
+				},
+			},
+		},
+		FailureModeAllow: false,
+		ProcessingMode: &envoyextprocv3.ProcessingMode{
+			RequestHeaderMode:   envoyextprocv3.ProcessingMode_SEND,
+			ResponseHeaderMode:  envoyextprocv3.ProcessingMode_SKIP,
+			RequestBodyMode:     envoyextprocv3.ProcessingMode_BUFFERED,
+			ResponseBodyMode:    envoyextprocv3.ProcessingMode_NONE,
+			RequestTrailerMode:  envoyextprocv3.ProcessingMode_SKIP,
+			ResponseTrailerMode: envoyextprocv3.ProcessingMode_SKIP,
+		},
+		StatPrefix: "lbac_ext_proc",
+		MetadataOptions: &envoyextprocv3.MetadataOptions{
+			ForwardingNamespaces: &envoyextprocv3.MetadataOptions_MetadataNamespaces{
+				Untyped: metaDataFrom,
+			},
+		},
+		AllowModeOverride: true,
+	}
+
+	extProcPB, err := anypb.New(&extProc)
+	if err != nil {
+		panic(err)
+	}
+
+	return &envoyconfigmanagerv3.HttpFilter{
+		Name: lbac.ServerName,
+		ConfigType: &envoyconfigmanagerv3.HttpFilter_TypedConfig{
+			TypedConfig: &anypb.Any{
+				TypeUrl: "type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor",
+				Value:   extProcPB.GetValue(),
+			},
+		},
+	}
 }
 
 func (m *MTLSConfig) toTransportSocket() *envoyconfigcorev3.TransportSocket {

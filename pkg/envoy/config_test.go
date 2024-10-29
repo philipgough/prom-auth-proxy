@@ -123,8 +123,8 @@ func TestOpts_Routing(t *testing.T) {
 	}
 	resource := runEnvoy(t, opts.BuildOrDie())
 
-	readPort := resource.GetPort(fmt.Sprintf("%d/tcp", MetricsReadListenerPort))
-	writePort := resource.GetPort(fmt.Sprintf("%d/tcp", MetricsWriteListenerPort))
+	readPort := resource.GetPort(fmt.Sprintf("%d/tcp", ReadListenerPort))
+	writePort := resource.GetPort(fmt.Sprintf("%d/tcp", WriteListenerPort))
 
 	resp, err := http.Get(fmt.Sprintf("http://localhost:%s%s", readPort, testReadPath))
 	if err != nil {
@@ -177,7 +177,7 @@ func TestOpts_HeaderManipulation(t *testing.T) {
 		},
 	}
 	resource := runEnvoy(t, opts.BuildOrDie())
-	readPort := resource.GetPort(fmt.Sprintf("%d/tcp", MetricsReadListenerPort))
+	readPort := resource.GetPort(fmt.Sprintf("%d/tcp", ReadListenerPort))
 	url := fmt.Sprintf("http://localhost:%s%s", readPort, testReadPath)
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
@@ -223,7 +223,7 @@ func TestOpts_HeaderAmendments(t *testing.T) {
 		},
 	}
 	resource := runEnvoy(t, opts.BuildOrDie())
-	port := resource.GetPort(fmt.Sprintf("%d/tcp", MetricsReadListenerPort))
+	port := resource.GetPort(fmt.Sprintf("%d/tcp", ReadListenerPort))
 	url := fmt.Sprintf("http://localhost:%s%s", port, testReadPath)
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
@@ -270,7 +270,7 @@ func TestOpts_HeaderMatching(t *testing.T) {
 		},
 	}
 	resource := runEnvoy(t, opts.BuildOrDie())
-	port := resource.GetPort(fmt.Sprintf("%d/tcp", MetricsReadListenerPort))
+	port := resource.GetPort(fmt.Sprintf("%d/tcp", ReadListenerPort))
 	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("http://localhost:%s%s", port, testReadPath), nil)
 	if err != nil {
 		t.Fatalf("could not create request: %s", err)
@@ -331,7 +331,7 @@ func TestOpts_TokenAuth_JWT(t *testing.T) {
 		},
 	}
 	resource := runEnvoy(t, opts.BuildOrDie())
-	port := resource.GetPort(fmt.Sprintf("%d/tcp", MetricsReadListenerPort))
+	port := resource.GetPort(fmt.Sprintf("%d/tcp", ReadListenerPort))
 	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("http://localhost:%s%s", port, testReadPath), nil)
 	if err != nil {
 		t.Fatalf("could not create request: %s", err)
@@ -402,7 +402,7 @@ func TestOpts_TokenAuth_JWT_RBAC(t *testing.T) {
 		},
 	}
 	resource := runEnvoy(t, opts.BuildOrDie())
-	port := resource.GetPort(fmt.Sprintf("%d/tcp", MetricsReadListenerPort))
+	port := resource.GetPort(fmt.Sprintf("%d/tcp", ReadListenerPort))
 	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("http://localhost:%s%s", port, testReadPath), nil)
 	if err != nil {
 		t.Fatalf("could not create request: %s", err)
@@ -503,7 +503,7 @@ func TestOpts_MTLS(t *testing.T) {
 		},
 	}
 	resource := runEnvoy(t, opts.BuildOrDie())
-	port := resource.GetPort(fmt.Sprintf("%d/tcp", MetricsReadListenerPort))
+	port := resource.GetPort(fmt.Sprintf("%d/tcp", ReadListenerPort))
 	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("http://localhost:%s%s", port, testReadPath), nil)
 	if err != nil {
 		t.Fatalf("could not create request: %s", err)
@@ -519,7 +519,7 @@ func TestOpts_MTLS(t *testing.T) {
 		t.Fatalf("expected status code 200, got %d", resp.StatusCode)
 	}
 
-	port = resource.GetPort(fmt.Sprintf("%d/tcp", MetricsWriteListenerPort))
+	port = resource.GetPort(fmt.Sprintf("%d/tcp", WriteListenerPort))
 	req, err = http.NewRequest(http.MethodGet, fmt.Sprintf("https://localhost:%s%s", port, testWritePath), nil)
 	if err != nil {
 		t.Fatalf("could not create request: %s", err)
@@ -588,7 +588,7 @@ func TestOpts_MTLS_RBAC(t *testing.T) {
 		},
 	}
 	resource := runEnvoy(t, opts.BuildOrDie())
-	port := resource.GetPort(fmt.Sprintf("%d/tcp", MetricsReadListenerPort))
+	port := resource.GetPort(fmt.Sprintf("%d/tcp", ReadListenerPort))
 	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("http://localhost:%s%s", port, testReadPath), nil)
 	if err != nil {
 		t.Fatalf("could not create request: %s", err)
@@ -604,7 +604,7 @@ func TestOpts_MTLS_RBAC(t *testing.T) {
 		t.Fatalf("expected status code 200, got %d", resp.StatusCode)
 	}
 
-	port = resource.GetPort(fmt.Sprintf("%d/tcp", MetricsWriteListenerPort))
+	port = resource.GetPort(fmt.Sprintf("%d/tcp", WriteListenerPort))
 	req, err = http.NewRequest(http.MethodGet, fmt.Sprintf("https://localhost:%s%s", port, testWritePath), nil)
 	if err != nil {
 		t.Fatalf("could not create request: %s", err)
@@ -665,8 +665,64 @@ func TestOpts_MTLS_RBAC(t *testing.T) {
 	if expectOkRep.StatusCode != http.StatusOK {
 		t.Fatalf("expected status code 200, got %d", expectOkRep.StatusCode)
 	}
-
 }
+
+//func TestOpts_LBAC(t *testing.T) {
+//	providerName := "istio_demo"
+//	jwtProvider := JWTProvider{
+//		Issuer: "testing@secure.istio.io",
+//		RemoteJWKsURI: RemoteJWKSURI{
+//			URI: "https://raw.githubusercontent.com/istio/istio/release-1.23/security/tools/jwt/samples/jwks.json",
+//		},
+//	}
+//
+//	policies := []lbac.RawPolicy{
+//		{
+//			Name:          "some-policy",
+//			CELExpression: "token.sub == 'testing@secure.istio.io'",
+//			Selectors: []lbac.RawSelector{
+//				{
+//
+//					LabelSelector: `{app='test'}`,
+//				},
+//			},
+//		},
+//	}
+//
+//	opts := Options{
+//		LBACServer: &LBACServerConfig{},
+//		TokenAuthConfig: &TokenAuthConfig{
+//			JWTProviders: map[string]JWTProvider{
+//				providerName: jwtProvider,
+//			},
+//		},
+//		MetricsReadOptions: &BackendOptions{
+//			LBACPolicies: policies,
+//			TokenAuthConfig: BackendTokenAuthConfig{
+//				JWTAuth: &BackendJWTAuth{
+//					ProviderName: providerName,
+//				},
+//			},
+//			BackendConfig: Backend{
+//				Address: "httpbin.org",
+//				Port:    80,
+//				Scheme:  "http",
+//			},
+//			MatchRouteRegex: "/anything/api/v1/query",
+//		},
+//	}
+//	resource := runEnvoy(t, opts.BuildOrDie())
+//
+//	readPort := resource.GetPort(fmt.Sprintf("%d/tcp", ReadListenerPort))
+//	resp, err := http.Get(fmt.Sprintf("http://localhost:%s%s", readPort, testReadPath))
+//	if err != nil {
+//		t.Fatalf("could not get response: %s", err)
+//	}
+//	defer resp.Body.Close()
+//	if resp.StatusCode != http.StatusOK {
+//		t.Fatalf("expected status code 200, got %d", resp.StatusCode)
+//	}
+//}
 
 // runEnvoy starts an envoy container with the provided config and returns the resource
 // it copies the certs from the testdata/certs directory to the temp directory and makes them
@@ -693,8 +749,8 @@ func runEnvoy(t *testing.T, withConfig string) *dockertest.Resource {
 
 	exposedPorts := []string{
 		fmt.Sprintf("%d", AdminPort),
-		fmt.Sprintf("%d", MetricsReadListenerPort),
-		fmt.Sprintf("%d", MetricsWriteListenerPort),
+		fmt.Sprintf("%d", ReadListenerPort),
+		fmt.Sprintf("%d", WriteListenerPort),
 	}
 
 	options := dockertest.RunOptions{
