@@ -28,7 +28,6 @@ import (
 	"github.com/golang/protobuf/ptypes/wrappers"
 	"github.com/philipgough/prom-auth-proxy/pkg/cel"
 	"github.com/philipgough/prom-auth-proxy/pkg/lbac"
-
 	v1alpha1 "google.golang.org/genproto/googleapis/api/expr/v1alpha1"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/types/known/anypb"
