@@ -15,6 +15,7 @@ import (
 	"github.com/ory/dockertest/v3"
 	"github.com/ory/dockertest/v3/docker"
 	"github.com/philipgough/prom-auth-proxy/pkg/lbac"
+	tokenreview "github.com/philipgough/prom-auth-proxy/pkg/token_review"
 )
 
 const (
@@ -741,9 +742,9 @@ func TestOpts_LBAC_JWT(t *testing.T) {
 		},
 		ReadOptions: &ReadBackend{
 			LBACConfig: &LBACConfig{
-				LBACServer: LBACServerConfig{
-					Address:  lbacName,
-					GrpcPort: 3001,
+				ServerConfig: LBACServerConfig{
+					Address: lbacName,
+					Port:    3001,
 				},
 				LBACPolicies: policies,
 			},
@@ -799,6 +800,55 @@ func TestOpts_LBAC_JWT(t *testing.T) {
 	if !strings.Contains(out.URL, `/anything/api/v1/query?query=up{app%3D"test"}`) {
 		t.Fatalf("expected URL to contain label selector, got %s", out.URL)
 	}
+}
+
+// This test does nothing currently other than dump config for local testing
+func TestOpts_KubernetesTokenAuth(t *testing.T) {
+	match := "/anything/.*"
+	policies := []lbac.RawPolicy{
+		{
+			Name:          "some-policy",
+			CELExpression: "token.sub == 'testing@secure.istio.io'",
+			Selectors: []lbac.RawSelector{
+				{
+
+					LabelSelector: `{app='test'}`,
+				},
+			},
+		},
+	}
+
+	opts := Options{
+		Signal: signal,
+		TokenAuthConfig: &TokenAuthConfig{
+			TokenReview: &TokenReviewServer{
+				Address: "localhost",
+				Port:    tokenreview.ServerDefaultPort,
+			},
+		},
+		ReadOptions: &ReadBackend{
+			LBACConfig: &LBACConfig{
+				ServerConfig: LBACServerConfig{
+					Address: lbacName,
+					Port:    3001,
+				},
+				LBACPolicies: policies,
+			},
+			BackendOptions: BackendOptions{
+				MatchRouteRegex: match,
+				BackendConfig: Backend{
+					Address: httpbinName,
+					Port:    httpPort,
+				},
+				TokenAuthConfig: BackendTokenAuthConfig{
+					EnableKubernetesTokenReview: true,
+				},
+			},
+		},
+	}
+
+	//_ = runLBACServer(t)
+	_ = runEnvoy(t, opts.BuildOrDie())
 }
 
 // runEnvoy starts an envoy container with the provided config and returns the resource

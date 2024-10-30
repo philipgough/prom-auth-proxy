@@ -37,10 +37,10 @@ const (
 
 // keys for userinfo
 const (
-	Username = "Username"
-	UID      = "UID"
-	Groups   = "Groups"
-	Extra    = "Extra"
+	Username = "username"
+	UID      = "uid"
+	Groups   = "groups"
+	Extra    = "extra"
 )
 
 // StatusToValue converts a TokenReview.Status to a structpb.Value referenced by the key.

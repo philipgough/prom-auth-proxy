@@ -33,7 +33,7 @@ func NewServer(config *tokenreview.Config, client kubernetes.Interface) *Server 
 		config.ExtractTokenFromHeader = tokenreview.DefaultAuthHeader
 	}
 	if config.MetaDataNamespace == "" {
-		config.MetaDataNamespace = tokenreview.DefaultMetadataNamespace
+		config.MetaDataNamespace = tokenreview.ServerName
 	}
 	if config.TokenKey == "" {
 		config.TokenKey = tokenreview.DefaultSubKey

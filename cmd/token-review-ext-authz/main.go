@@ -75,10 +75,10 @@ func main() {
 
 func init() {
 	flag.IntVar(&port, "port", tokenreview.ServerDefaultPort, "The port to listen on")
-	flag.StringVar(&metadataNamespace, "metadata-namespace", tokenreview.DefaultMetadataNamespace, "The namespace to write the metadata to")
+	flag.StringVar(&metadataNamespace, "metadata-namespace", tokenreview.ServerName, "The namespace to write the metadata to")
 	flag.StringVar(&tokenKey, "token-key", tokenreview.DefaultSubKey, "The key to use for the token in the metadata")
 	flag.StringVar(&extractTokenFromHeader, "extract-token-from-header", tokenreview.DefaultAuthHeader, "The header to extract the token from")
-	flag.StringVar(&kubeconfig, "kubeconfig", "/Users/pgough/.kube/config", "Path to a kubeconfig. Only required if out-of-cluster.")
+	flag.StringVar(&kubeconfig, "kubeconfig", "", "Path to a kubeconfig. Only required if out-of-cluster.")
 	flag.StringVar(&masterURL, "master", "",
 		"The address of the Kubernetes API server. Overrides any value in kubeconfig. Only required if out-of-cluster.",
 	)

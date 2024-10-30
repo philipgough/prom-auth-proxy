@@ -13,6 +13,7 @@ import (
 	envoylistenerv3 "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	rbacv3 "github.com/envoyproxy/go-control-plane/envoy/config/rbac/v3"
 	envoyroutev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+	envoyextauthz3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_authz/v3"
 	envoyextprocv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_proc/v3"
 	envoyheadermutationv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/header_mutation/v3"
 	envoyjwtauthnv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/jwt_authn/v3"
@@ -28,6 +29,8 @@ import (
 	"github.com/golang/protobuf/ptypes/wrappers"
 	"github.com/philipgough/prom-auth-proxy/pkg/cel"
 	"github.com/philipgough/prom-auth-proxy/pkg/lbac"
+	tokenreview "github.com/philipgough/prom-auth-proxy/pkg/token_review"
+
 	v1alpha1 "google.golang.org/genproto/googleapis/api/expr/v1alpha1"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/types/known/anypb"
@@ -49,7 +52,9 @@ const (
 	WriteListenerPort = 8081
 	writeStatsPrefix  = "write_http"
 
-	jwtFilterName = "envoy.filters.http.jwt_authn"
+	jwtFilterName                 = "envoy.filters.http.jwt_authn"
+	kubernetesTokenAuthFilterName = tokenreview.ServerName
+	kubernetesTokenReviewCluster  = "kubernetes_token_review"
 
 	tokenMetadataKey       = "token"
 	tokenInMetadataPathJWT = "metadata.filter_metadata['envoy.filters.http.jwt_authn'].token."
@@ -175,15 +180,24 @@ type RemoteJWKSURI struct {
 type JWTProviders map[string]JWTProvider
 
 // TokenAuthConfig is the configuration for token authentication.
+// Only one of JWTProviders or TokenReview can be specified.
 type TokenAuthConfig struct {
 	JWTProviders JWTProviders
+	// TokenReview is the configuration for the token review server.
+	TokenReview *TokenReviewServer
 }
 
 // BackendTokenAuthConfig is the per-backend configuration for token authentication.
+// Only one of JWTAuth or EnableKubernetesTokenReview can be specified.
+// If neither is specified, token authentication will not be enabled.
+// If both are specified, the configuration will be invalid.
 type BackendTokenAuthConfig struct {
 	// JWTAuth is the JWT authentication configuration.
 	// If not specified, the JWT authentication will not be enabled.
 	JWTAuth *BackendJWTAuth
+	// EnableTokenReview enables token review.
+	// If not specified, token review will not be enabled.
+	EnableKubernetesTokenReview bool
 }
 
 // BackendJWTAuth is the per-backend configuration for JWT authentication.
@@ -211,18 +225,24 @@ type MTLSConfig struct {
 
 // LBACServerConfig is the configuration for the label-based access control server.
 // This is a server that implements the ExternalProcessor interface.
-type LBACServerConfig struct {
-	// Address is the address to listen on for requests.
-	Address string
-	// Port is the port to listen on for gRPC requests.
-	GrpcPort uint32
-}
+type LBACServerConfig GRPCServer
 
 // LBACConfig is the configuration for label based access control.
 type LBACConfig struct {
-	LBACServer LBACServerConfig
+	ServerConfig LBACServerConfig
 	// LBACPolicies is the list of CEL policies for label based access control.
 	LBACPolicies []lbac.RawPolicy
+}
+
+// TokenReviewServer is the configuration for the token review server.
+type TokenReviewServer GRPCServer
+
+// GRPCServer is the configuration for the gRPC server.
+type GRPCServer struct {
+	// Address is the address to listen on for requests.
+	Address string
+	// Port is the port to listen on for gRPC requests.
+	Port uint32
 }
 
 // Options is the configuration for the gateway.
@@ -240,29 +260,40 @@ type Options struct {
 // BuildOrDie returns raw YAML configuration for envoy proxy or panics if it fails.
 func (opts Options) BuildOrDie() string {
 	var listenerConfigs []*envoylistenerv3.Listener
+	var forwardingNamespace string
+	var jwtTokenAuthEnabled bool
+	var kubernetesTokenReviewEnabled bool
 
-	var forwardingNamespaces string
 	if opts.TokenAuthConfig != nil {
-		if opts.TokenAuthConfig.JWTProviders != nil {
-			var backends []BackendOptions
-			if opts.ReadOptions != nil {
-				backends = append(backends, opts.ReadOptions.BackendOptions)
-			}
-			if opts.WriteOptions != nil {
-				backends = append(backends, opts.WriteOptions.BackendOptions)
-			}
+		jwtTokenAuthEnabled = len(opts.TokenAuthConfig.JWTProviders) > 0
+		kubernetesTokenReviewEnabled = opts.TokenAuthConfig.TokenReview != nil
 
-			for _, backend := range backends {
-				if backend.TokenAuthConfig.JWTAuth != nil {
-					forwardingNamespaces = jwtFilterName
-					namedJWTProvider := backend.TokenAuthConfig.JWTAuth.ProviderName
-					if jwtProvider, ok := opts.TokenAuthConfig.JWTProviders[namedJWTProvider]; !ok {
-						panic(fmt.Errorf("JWT provider %s not found in token auth config", namedJWTProvider))
-					} else {
-						backend.TokenAuthConfig.JWTAuth.provider = jwtProvider
-					}
-				}
+		if jwtTokenAuthEnabled && kubernetesTokenReviewEnabled {
+			panic("only one of JWTProviders or TokenReview can be specified")
+		}
+	}
+	attachTokenAuth := func(backend BackendOptions) {
+		if backend.TokenAuthConfig.JWTAuth != nil && backend.TokenAuthConfig.EnableKubernetesTokenReview {
+			panic("only one of JWTAuth or EnableKubernetesTokenReview can be specified")
+		}
+
+		if backend.TokenAuthConfig.JWTAuth != nil {
+			if !jwtTokenAuthEnabled {
+				panic("JWTAuth specified but JWTProviders not specified")
 			}
+			forwardingNamespace = jwtFilterName
+			namedJWTProvider := backend.TokenAuthConfig.JWTAuth.ProviderName
+			if jwtProvider, ok := opts.TokenAuthConfig.JWTProviders[namedJWTProvider]; !ok {
+				panic(fmt.Errorf("JWT provider %s not found in token auth config", namedJWTProvider))
+			} else {
+				backend.TokenAuthConfig.JWTAuth.provider = jwtProvider
+			}
+		}
+		if backend.TokenAuthConfig.EnableKubernetesTokenReview {
+			if !kubernetesTokenReviewEnabled {
+				panic("EnableKubernetesTokenReview specified but TokenReview not specified")
+			}
+			forwardingNamespace = kubernetesTokenAuthFilterName
 		}
 	}
 
@@ -272,6 +303,7 @@ func (opts Options) BuildOrDie() string {
 		o.listenerName = readListenerName
 		o.listenerPort = ReadListenerPort
 		o.statsPrefix = strings.TrimPrefix(fmt.Sprintf("%s_%s", opts.Signal, readStatsPrefix), "_")
+		attachTokenAuth(o.BackendOptions)
 
 		var filters []*envoyconfigmanagerv3.HttpFilter
 		if len(o.RBACPolicies) > 0 {
@@ -279,7 +311,7 @@ func (opts Options) BuildOrDie() string {
 		}
 
 		if o.LBACConfig != nil && len(o.LBACConfig.LBACPolicies) > 0 {
-			filters = append(filters, lbacTOHttpFilters(o.LBACConfig.LBACPolicies, forwardingNamespaces)...)
+			filters = append(filters, lbacTOHttpFilters(o.LBACConfig.LBACPolicies, forwardingNamespace)...)
 		}
 		listenerConfigs = append(listenerConfigs, buildListenerConfig(o.BackendOptions, filters...))
 	}
@@ -290,6 +322,7 @@ func (opts Options) BuildOrDie() string {
 		o.listenerName = writeListenerName
 		o.listenerPort = WriteListenerPort
 		o.statsPrefix = strings.TrimPrefix(fmt.Sprintf("%s_%s", opts.Signal, writeStatsPrefix), "_")
+		attachTokenAuth(o.BackendOptions)
 
 		var filters []*envoyconfigmanagerv3.HttpFilter
 		if len(o.RBACPolicies) > 0 {
@@ -327,8 +360,9 @@ func buildListenerConfig(opts BackendOptions, filters ...*envoyconfigmanagerv3.H
 		httpFilters = append(httpFilters, opts.HeaderMutations.toHttpFilter())
 	}
 
-	if opts.TokenAuthConfig.JWTAuth != nil {
-		httpFilters = append(httpFilters, opts.TokenAuthConfig.JWTAuth.toHttpFilter(opts.MatchRouteRegex))
+	tokenFilter := opts.TokenAuthConfig.toHttpFilter()
+	if tokenFilter != nil {
+		httpFilters = append(httpFilters, tokenFilter)
 	}
 
 	if len(filters) > 0 {
@@ -429,12 +463,16 @@ func (opts Options) toClusters() []*envoyconfigclusterv3.Cluster {
 		clusters = append(clusters, opts.WriteOptions.BackendConfig.toCluster(signalWriteClusterName))
 	}
 
-	if opts.TokenAuthConfig != nil && len(opts.TokenAuthConfig.JWTProviders) > 0 {
-		clusters = append(clusters, opts.TokenAuthConfig.JWTProviders.toClusters()...)
+	if opts.TokenAuthConfig != nil {
+		if len(opts.TokenAuthConfig.JWTProviders) > 0 {
+			clusters = append(clusters, opts.TokenAuthConfig.JWTProviders.toClusters()...)
+		} else if opts.TokenAuthConfig.TokenReview != nil {
+			clusters = append(clusters, opts.TokenAuthConfig.TokenReview.toCluster())
+		}
 	}
 
 	if opts.ReadOptions != nil && opts.ReadOptions.LBACConfig != nil {
-		clusters = append(clusters, opts.ReadOptions.LBACConfig.LBACServer.toCluster())
+		clusters = append(clusters, opts.ReadOptions.LBACConfig.ServerConfig.toCluster())
 	}
 
 	return clusters
@@ -636,23 +674,84 @@ func (l *LBACServerConfig) toCluster() *envoyconfigclusterv3.Cluster {
 	if l == nil {
 		return nil
 	}
-	// we set this here because we expect this typically to run as a sidecar with envoy
+
+	g := GRPCServer{
+		Address: l.Address,
+		Port:    l.Port,
+	}
+	return g.toCluster(lbac.ServerName)
+}
+
+func (tr *TokenReviewServer) toCluster() *envoyconfigclusterv3.Cluster {
+	if tr == nil {
+		return nil
+	}
+
+	g := GRPCServer{
+		Address: tr.Address,
+		Port:    tr.Port,
+	}
+	return g.toCluster(kubernetesTokenReviewCluster)
+}
+
+func (g GRPCServer) toCluster(name string) *envoyconfigclusterv3.Cluster {
 	address := "localhost"
-	if l.Address != "" {
-		address = l.Address
+	if g.Address != "" {
+		address = g.Address
 	}
 
-	port := uint32(lbac.ServerDefaultPort)
-	if l.GrpcPort != 0 {
-		port = l.GrpcPort
+	port := uint32(0)
+	if g.Port != 0 {
+		port = g.Port
 	}
-
-	c := buildEnvoyCluster(lbac.ServerName, "http", address, port, envoyconfigclusterv3.Cluster_STRICT_DNS)
+	c := buildEnvoyCluster(name, "http", address, port, envoyconfigclusterv3.Cluster_STRICT_DNS)
 	c.Http2ProtocolOptions = &envoyconfigcorev3.Http2ProtocolOptions{}
 	return c
 }
 
+func (bta BackendTokenAuthConfig) toHttpFilter() *envoyconfigmanagerv3.HttpFilter {
+	if bta.JWTAuth != nil {
+		return bta.JWTAuth.toHttpFilter("")
+	}
+
+	if bta.EnableKubernetesTokenReview {
+		authz := envoyextauthz3.ExtAuthz{
+			TransportApiVersion: envoyconfigcorev3.ApiVersion_V3,
+			Services: &envoyextauthz3.ExtAuthz_GrpcService{
+				GrpcService: &envoyconfigcorev3.GrpcService{
+					TargetSpecifier: &envoyconfigcorev3.GrpcService_EnvoyGrpc_{
+						EnvoyGrpc: &envoyconfigcorev3.GrpcService_EnvoyGrpc{
+							ClusterName: kubernetesTokenReviewCluster,
+						},
+					},
+				},
+			},
+		}
+
+		authPB, err := anypb.New(&authz)
+		if err != nil {
+			panic(err)
+		}
+
+		extAuthzFilter := &envoyconfigmanagerv3.HttpFilter{
+			Name: tokenreview.ServerName,
+			ConfigType: &envoyconfigmanagerv3.HttpFilter_TypedConfig{
+				TypedConfig: &anypb.Any{
+					TypeUrl: "type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz",
+					Value:   authPB.Value,
+				},
+			},
+		}
+		return extAuthzFilter
+	}
+
+	return nil
+}
+
 func (bja BackendJWTAuth) toHttpFilter(matchPrefixRegex string) *envoyconfigmanagerv3.HttpFilter {
+	if matchPrefixRegex == "" {
+		matchPrefixRegex = "/.*"
+	}
 	providerName := getJWTClusterName(bja.ProviderName)
 	rt := &envoyjwtauthnv3.RequirementRule_Requires{
 		Requires: &envoyjwtauthnv3.JwtRequirement{
