@@ -3,11 +3,11 @@ package tokenreview
 import (
 	"context"
 	"fmt"
-
 	"strings"
 
 	authv3 "github.com/envoyproxy/go-control-plane/envoy/service/auth/v3"
 	typev3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
+	tokenreview "github.com/philipgough/prom-auth-proxy/pkg/token_review"
 
 	"google.golang.org/protobuf/types/known/structpb"
 
@@ -16,30 +16,31 @@ import (
 	"k8s.io/client-go/kubernetes"
 )
 
-const (
-	defaultAuthHeader = "authorization"
-)
-
-// Config is the configuration for the server.
-type Config struct {
-	// ExtractTokenFromHeader determines what header to extract the token from.
-	// If true, the token will be extracted from the Authorization header.
-	ExtractTokenFromHeader string `json:"extract_token_from_header"`
-	// MetadataNamespace is the namespace to use for the metadata.
-	MetaDataNamespace string `json:"metadata_namespace"`
-}
-
 // Server is the server that implements the AuthorizationServer interface.
 // Server issues TokenReview requests to the Kubernetes API server for a set of requested paths.
 type Server struct {
-	config Config
+	config tokenreview.Config
 	client kubernetes.Interface
 }
 
 // NewServer creates a new Server.
-func NewServer(config Config, client kubernetes.Interface) *Server {
+func NewServer(config *tokenreview.Config, client kubernetes.Interface) *Server {
+	if config == nil {
+		config = &tokenreview.Config{}
+	}
+
+	if config.ExtractTokenFromHeader == "" {
+		config.ExtractTokenFromHeader = tokenreview.DefaultAuthHeader
+	}
+	if config.MetaDataNamespace == "" {
+		config.MetaDataNamespace = tokenreview.DefaultMetadataNamespace
+	}
+	if config.TokenKey == "" {
+		config.TokenKey = tokenreview.DefaultSubKey
+	}
+
 	return &Server{
-		config: config,
+		config: *config,
 		client: client,
 	}
 }
@@ -74,7 +75,7 @@ func (s *Server) Check(ctx context.Context, request *authv3.CheckRequest) (*auth
 	resp.DynamicMetadata.Fields[s.config.MetaDataNamespace] = &structpb.Value{
 		Kind: &structpb.Value_StructValue{
 			StructValue: &structpb.Struct{
-				Fields: s.tokenReviewToMetadata(tokenReviewResult),
+				Fields: tokenreview.StatusToValue(s.config.TokenKey, tokenReviewResult.Status),
 			},
 		},
 	}
@@ -99,7 +100,7 @@ func (s *Server) extractToken(request *authv3.CheckRequest) (string, error) {
 		return "", fmt.Errorf("no token in headers")
 	}
 
-	if header == defaultAuthHeader {
+	if strings.ToLower(header) == tokenreview.DefaultAuthHeader {
 		// The token is expected to be in the format "Bearer <token>
 		token = strings.TrimPrefix(token, "Bearer ")
 	}
@@ -139,44 +140,4 @@ func (s *Server) doTokenReview(ctx context.Context, token string) (*authv1.Token
 		},
 	}
 	return s.client.AuthenticationV1().TokenReviews().Create(ctx, tr, metav1.CreateOptions{})
-}
-
-func (s *Server) tokenReviewToMetadata(tr *authv1.TokenReview) map[string]*structpb.Value {
-	data := map[string]*structpb.Value{
-		"username": {
-			Kind: &structpb.Value_StringValue{
-				StringValue: tr.Status.User.Username,
-			},
-		},
-		"uid": {
-			Kind: &structpb.Value_StringValue{
-				StringValue: tr.Status.User.UID,
-			},
-		},
-	}
-
-	if len(tr.Status.User.Groups) > 0 {
-		values := make([]*structpb.Value, len(tr.Status.User.Groups))
-		for i, group := range tr.Status.User.Groups {
-			values[i] = &structpb.Value{
-				Kind: &structpb.Value_StringValue{
-					StringValue: group,
-				},
-			}
-		}
-		data["groups"] = &structpb.Value{Kind: &structpb.Value_ListValue{ListValue: &structpb.ListValue{Values: values}}}
-	}
-
-	if len(tr.Status.Audiences) > 0 {
-		values := make([]*structpb.Value, len(tr.Status.Audiences))
-		for i, audience := range tr.Status.Audiences {
-			values[i] = &structpb.Value{
-				Kind: &structpb.Value_StringValue{
-					StringValue: audience,
-				},
-			}
-		}
-		data["audiences"] = &structpb.Value{Kind: &structpb.Value_ListValue{ListValue: &structpb.ListValue{Values: values}}}
-	}
-	return data
 }

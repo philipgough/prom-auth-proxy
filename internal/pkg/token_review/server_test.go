@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	authv3 "github.com/envoyproxy/go-control-plane/envoy/service/auth/v3"
+	tokenreview "github.com/philipgough/prom-auth-proxy/pkg/token_review"
 
 	authv1 "k8s.io/api/authentication/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -58,7 +59,7 @@ func validCheckRequest(path, token string) *authv3.CheckRequest {
 				Http: &authv3.AttributeContext_HttpRequest{
 					Path: path,
 					Headers: map[string]string{
-						"Authorization": "Bearer " + token,
+						tokenreview.DefaultAuthHeader: "Bearer " + token,
 					},
 				},
 			},
@@ -66,27 +67,9 @@ func validCheckRequest(path, token string) *authv3.CheckRequest {
 	}
 }
 
-func TestCheck_AllowedPath(t *testing.T) {
-	client := &MockKubernetesClient{}
-	server := NewServer(Config{Paths: []string{"/allowed"}}, client)
-
-	req := validCheckRequest("/not-allowed", "valid-token")
-	resp, err := server.Check(context.Background(), req)
-
-	if err != nil {
-		t.Fatalf("expected no error, got %v", err)
-	}
-	if resp == nil {
-		t.Fatalf("expected response, got nil")
-	}
-	if _, ok := resp.HttpResponse.(*authv3.CheckResponse_OkResponse); !ok {
-		t.Fatalf("expected OkResponse, got %T", resp.HttpResponse)
-	}
-}
-
 func TestCheck_NoTokenInHeader(t *testing.T) {
 	client := &MockKubernetesClient{}
-	server := NewServer(Config{Paths: []string{"/allowed"}, ExtractTokenFromHeader: "Authorization"}, client)
+	server := NewServer(nil, client)
 
 	req := validCheckRequest("/allowed", "")
 	resp, err := server.Check(context.Background(), req)
@@ -109,7 +92,7 @@ func TestCheck_NoTokenInHeader(t *testing.T) {
 
 func TestCheck_TokenReviewFails(t *testing.T) {
 	client := &MockKubernetesClient{}
-	server := NewServer(Config{Paths: []string{"/allowed"}, ExtractTokenFromHeader: "Authorization"}, client)
+	server := NewServer(nil, client)
 
 	req := validCheckRequest("/allowed", "invalid-token")
 	resp, err := server.Check(context.Background(), req)
@@ -137,7 +120,7 @@ func TestCheck_TokenNotAuthenticated(t *testing.T) {
 			},
 		},
 	}
-	server := NewServer(Config{Paths: []string{"/allowed"}, ExtractTokenFromHeader: "Authorization"}, client)
+	server := NewServer(nil, client)
 
 	req := validCheckRequest("/allowed", "invalid-token")
 	resp, err := server.Check(context.Background(), req)
@@ -173,7 +156,8 @@ func TestCheck_Success(t *testing.T) {
 			},
 		},
 	}
-	server := NewServer(Config{Paths: []string{"/allowed"}, ExtractTokenFromHeader: defaultAuthHeader, MetaDataNamespace: metaDataNamespace}, client)
+	c := &tokenreview.Config{MetaDataNamespace: metaDataNamespace}
+	server := NewServer(c, client)
 	req := validCheckRequest("/allowed", "valid-token")
 	resp, err := server.Check(context.Background(), req)
 
@@ -195,15 +179,42 @@ func TestCheck_Success(t *testing.T) {
 		t.Fatalf("expected metadata fields, got nil")
 	}
 
-	if resp.DynamicMetadata.Fields[metaDataNamespace].GetStructValue().Fields["username"].GetStringValue() != "test-user" {
-		t.Fatalf("expected username test-user, got %s", resp.DynamicMetadata.Fields[metaDataNamespace].GetStructValue().Fields["username"].GetStringValue())
+	fields := resp.DynamicMetadata.Fields[metaDataNamespace].GetStructValue().Fields
+	if fields == nil {
+		t.Fatalf("expected fields, got nil")
 	}
 
-	if resp.DynamicMetadata.Fields[metaDataNamespace].GetStructValue().Fields["groups"].GetListValue().Values[0].GetStringValue() != "test-group" {
-		t.Fatalf("expected group test-group, got %s", resp.DynamicMetadata.Fields[metaDataNamespace].GetStructValue().Fields["groups"].GetListValue().Values[0].GetStringValue())
+	token := fields[c.TokenKey].GetStructValue().Fields
+	if token == nil {
+		t.Fatalf("expected token, got nil")
 	}
 
-	if resp.DynamicMetadata.Fields[metaDataNamespace].GetStructValue().Fields["audiences"].GetListValue().Values[0].GetStringValue() != "test-audience" {
-		t.Fatalf("expected audience test-audience, got %s", resp.DynamicMetadata.Fields[metaDataNamespace].GetStructValue().Fields["audiences"].GetListValue().Values[0].GetStringValue())
+	userinfo := token[tokenreview.UserKey].GetStructValue().Fields
+	if userinfo == nil {
+		t.Fatalf("expected userinfo, got nil")
+	}
+
+	if userinfo[tokenreview.Username].GetStringValue() != "test-user" {
+		t.Fatalf("expected username test-user, got %s", userinfo[tokenreview.Username].GetStringValue())
+	}
+
+	groups := userinfo[tokenreview.Groups].GetListValue().Values
+	if groups[0].GetStringValue() != "test-group" {
+		t.Fatalf("expected group test-group, got %s", groups[0].GetStringValue())
+	}
+
+	extra := userinfo[tokenreview.Extra].GetStructValue().Fields
+	if extra["test-key"].GetListValue().Values[0].GetStringValue() != "test-value" {
+		t.Fatalf("expected extra test-value, got %s", extra["test-key"].GetListValue().Values[0].GetStringValue())
+	}
+
+	audiences := token[tokenreview.AudiencesKey].GetListValue().Values
+	if audiences[0].GetStringValue() != "test-audience" {
+		t.Fatalf("expected audience test-audience, got %s", audiences[0].GetStringValue())
+	}
+
+	authenticated := token[tokenreview.AuthenticatedKey].GetBoolValue()
+	if !authenticated {
+		t.Fatalf("expected authenticated true, got false")
 	}
 }
