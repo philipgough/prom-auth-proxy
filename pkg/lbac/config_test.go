@@ -278,7 +278,6 @@ func TestRawPolicyToFilterMetadata(t *testing.T) {
 		{
 			name: "ValidInput",
 			input: []byte(`
-policies:
   - name: policy1
     expression: "request.method == 'GET'"
     selectors:

@@ -14,6 +14,7 @@ import (
 
 	"github.com/ory/dockertest/v3"
 	"github.com/ory/dockertest/v3/docker"
+	"github.com/philipgough/prom-auth-proxy/pkg/lbac"
 )
 
 const (
@@ -24,9 +25,15 @@ const (
 	httpPort     = 80
 	httpbinImage = "kennethreitz/httpbin"
 	httpbinTag   = "latest"
+
+	lbacName  = "lbac"
+	lbacImage = "quay.io/philipgough/lbac"
+	lbacTag   = "latest"
 )
 
 const (
+	signal = "metrics"
+
 	testReadPath  = "/anything"
 	testWritePath = "/anything/else"
 
@@ -106,23 +113,28 @@ func TestMain(m *testing.M) {
 
 func TestOpts_Routing(t *testing.T) {
 	opts := Options{
-		MetricsReadOptions: &BackendOptions{
-			BackendConfig: Backend{
-				Address: httpbinName,
-				Port:    httpPort,
+		Signal: signal,
+		ReadOptions: &ReadBackend{
+			BackendOptions: BackendOptions{
+				BackendConfig: Backend{
+					Address: httpbinName,
+					Port:    httpPort,
+				},
+				MatchRouteRegex: testReadPath,
 			},
-			MatchRouteRegex: testReadPath,
 		},
-		MetricsWriteOptions: &BackendOptions{
-			BackendConfig: Backend{
-				Address: httpbinName,
-				Port:    httpPort,
+		WriteOptions: &WriteBackend{
+			BackendOptions: BackendOptions{
+				BackendConfig: Backend{
+					Address: httpbinName,
+					Port:    httpPort,
+				},
+				MatchRouteRegex: testWritePath,
 			},
-			MatchRouteRegex: testWritePath,
 		},
 	}
-	resource := runEnvoy(t, opts.BuildOrDie())
 
+	resource := runEnvoy(t, opts.BuildOrDie())
 	readPort := resource.GetPort(fmt.Sprintf("%d/tcp", ReadListenerPort))
 	writePort := resource.GetPort(fmt.Sprintf("%d/tcp", WriteListenerPort))
 
@@ -160,22 +172,26 @@ func TestOpts_HeaderManipulation(t *testing.T) {
 	toHeader := "X-Thanos-Tenant"
 
 	opts := Options{
-		MetricsReadOptions: &BackendOptions{
-			BackendConfig: Backend{
-				Address: httpbinName,
-				Port:    httpPort,
-			},
-			MatchRouteRegex: testReadPath,
-			HeaderMutations: []HeaderMutation{
-				{
-					SetHeader: toHeader,
-					FromValue: ExistingHeaderMutation{
-						FromRequestHeader: fromHeader,
+		Signal: signal,
+		ReadOptions: &ReadBackend{
+			BackendOptions: BackendOptions{
+				BackendConfig: Backend{
+					Address: httpbinName,
+					Port:    httpPort,
+				},
+				MatchRouteRegex: testReadPath,
+				HeaderMutations: []HeaderMutation{
+					{
+						SetHeader: toHeader,
+						FromValue: ExistingHeaderMutation{
+							FromRequestHeader: fromHeader,
+						},
 					},
 				},
 			},
 		},
 	}
+
 	resource := runEnvoy(t, opts.BuildOrDie())
 	readPort := resource.GetPort(fmt.Sprintf("%d/tcp", ReadListenerPort))
 	url := fmt.Sprintf("http://localhost:%s%s", readPort, testReadPath)
@@ -207,21 +223,26 @@ func TestOpts_HeaderAmendments(t *testing.T) {
 
 	someHeaderToAddAtRouteMatch := "X-Some-Test-Header"
 	someHeaderToAddAtRouteMatchVal := "test-add"
+
 	opts := Options{
-		MetricsReadOptions: &BackendOptions{
-			HeaderAmendments: HeaderAmendments{
-				AddHeaders: map[string]string{
-					someHeaderToAddAtRouteMatch: someHeaderToAddAtRouteMatchVal,
+		Signal: signal,
+		ReadOptions: &ReadBackend{
+			BackendOptions: BackendOptions{
+				BackendConfig: Backend{
+					Address: httpbinName,
+					Port:    httpPort,
 				},
-				RemoveHeaders: []string{someHeaderToInitiallySend},
-			},
-			MatchRouteRegex: testReadPath,
-			BackendConfig: Backend{
-				Address: httpbinName,
-				Port:    httpPort,
+				HeaderAmendments: HeaderAmendments{
+					AddHeaders: map[string]string{
+						someHeaderToAddAtRouteMatch: someHeaderToAddAtRouteMatchVal,
+					},
+					RemoveHeaders: []string{someHeaderToInitiallySend},
+				},
+				MatchRouteRegex: testReadPath,
 			},
 		},
 	}
+
 	resource := runEnvoy(t, opts.BuildOrDie())
 	port := resource.GetPort(fmt.Sprintf("%d/tcp", ReadListenerPort))
 	url := fmt.Sprintf("http://localhost:%s%s", port, testReadPath)
@@ -257,18 +278,22 @@ func TestOpts_HeaderMatching(t *testing.T) {
 	fromHeaderVal := "test"
 
 	opts := Options{
-		MetricsReadOptions: &BackendOptions{
-			HeaderMatcher: &HeaderMatcher{
-				Name:  fromHeader,
-				Regex: fromHeaderVal,
-			},
-			MatchRouteRegex: testReadPath,
-			BackendConfig: Backend{
-				Address: httpbinName,
-				Port:    httpPort,
+		Signal: signal,
+		ReadOptions: &ReadBackend{
+			BackendOptions: BackendOptions{
+				HeaderMatcher: &HeaderMatcher{
+					Name:  fromHeader,
+					Regex: fromHeaderVal,
+				},
+				MatchRouteRegex: testReadPath,
+				BackendConfig: Backend{
+					Address: httpbinName,
+					Port:    httpPort,
+				},
 			},
 		},
 	}
+
 	resource := runEnvoy(t, opts.BuildOrDie())
 	port := resource.GetPort(fmt.Sprintf("%d/tcp", ReadListenerPort))
 	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("http://localhost:%s%s", port, testReadPath), nil)
@@ -312,24 +337,28 @@ func TestOpts_TokenAuth_JWT(t *testing.T) {
 	}
 
 	opts := Options{
+		Signal: signal,
 		TokenAuthConfig: &TokenAuthConfig{
 			JWTProviders: map[string]JWTProvider{
 				providerName: jwtProvider,
 			},
 		},
-		MetricsReadOptions: &BackendOptions{
-			MatchRouteRegex: testReadPath,
-			BackendConfig: Backend{
-				Address: httpbinName,
-				Port:    httpPort,
-			},
-			TokenAuthConfig: BackendTokenAuthConfig{
-				JWTAuth: &BackendJWTAuth{
-					ProviderName: providerName,
+		ReadOptions: &ReadBackend{
+			BackendOptions: BackendOptions{
+				MatchRouteRegex: testReadPath,
+				BackendConfig: Backend{
+					Address: httpbinName,
+					Port:    httpPort,
+				},
+				TokenAuthConfig: BackendTokenAuthConfig{
+					JWTAuth: &BackendJWTAuth{
+						ProviderName: providerName,
+					},
 				},
 			},
 		},
 	}
+
 	resource := runEnvoy(t, opts.BuildOrDie())
 	port := resource.GetPort(fmt.Sprintf("%d/tcp", ReadListenerPort))
 	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("http://localhost:%s%s", port, testReadPath), nil)
@@ -379,28 +408,31 @@ func TestOpts_TokenAuth_JWT_RBAC(t *testing.T) {
 	}
 
 	opts := Options{
-		CELPolicies: CELPolicies{
-			"some-test-policy": "'group1' in token.groups",
-		},
+		Signal: signal,
 		TokenAuthConfig: &TokenAuthConfig{
 			JWTProviders: map[string]JWTProvider{
 				providerName: jwtProvider,
 			},
 		},
-		MetricsReadOptions: &BackendOptions{
-			NamedCELRBACPolicies: []string{"some-test-policy"},
-			MatchRouteRegex:      testReadPath,
-			BackendConfig: Backend{
-				Address: httpbinName,
-				Port:    httpPort,
+		ReadOptions: &ReadBackend{
+			RBACPolicies: map[string]string{
+				"some-test-policy": "'group1' in token.groups",
 			},
-			TokenAuthConfig: BackendTokenAuthConfig{
-				JWTAuth: &BackendJWTAuth{
-					ProviderName: providerName,
+			BackendOptions: BackendOptions{
+				MatchRouteRegex: testReadPath,
+				BackendConfig: Backend{
+					Address: httpbinName,
+					Port:    httpPort,
+				},
+				TokenAuthConfig: BackendTokenAuthConfig{
+					JWTAuth: &BackendJWTAuth{
+						ProviderName: providerName,
+					},
 				},
 			},
 		},
 	}
+
 	resource := runEnvoy(t, opts.BuildOrDie())
 	port := resource.GetPort(fmt.Sprintf("%d/tcp", ReadListenerPort))
 	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("http://localhost:%s%s", port, testReadPath), nil)
@@ -482,26 +514,32 @@ func TestOpts_TokenAuth_JWT_RBAC(t *testing.T) {
 
 func TestOpts_MTLS(t *testing.T) {
 	opts := Options{
-		MetricsReadOptions: &BackendOptions{
-			MatchRouteRegex: testReadPath,
-			BackendConfig: Backend{
-				Address: httpbinName,
-				Port:    httpPort,
+		Signal: signal,
+		ReadOptions: &ReadBackend{
+			BackendOptions: BackendOptions{
+				BackendConfig: Backend{
+					Address: httpbinName,
+					Port:    httpPort,
+				},
+				MatchRouteRegex: testReadPath,
 			},
 		},
-		MetricsWriteOptions: &BackendOptions{
-			BackendConfig: Backend{
-				Address: httpbinName,
-				Port:    httpPort,
-			},
-			MatchRouteRegex: testWritePath,
-			MTLSConfig: &MTLSConfig{
-				TrustedCA:  caFilePath,
-				ServerCert: certPath,
-				ServerKey:  keyPath,
+		WriteOptions: &WriteBackend{
+			BackendOptions: BackendOptions{
+				BackendConfig: Backend{
+					Address: httpbinName,
+					Port:    httpPort,
+				},
+				MatchRouteRegex: testWritePath,
+				MTLSConfig: &MTLSConfig{
+					TrustedCA:  caFilePath,
+					ServerCert: certPath,
+					ServerKey:  keyPath,
+				},
 			},
 		},
 	}
+
 	resource := runEnvoy(t, opts.BuildOrDie())
 	port := resource.GetPort(fmt.Sprintf("%d/tcp", ReadListenerPort))
 	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("http://localhost:%s%s", port, testReadPath), nil)
@@ -561,32 +599,36 @@ func TestOpts_MTLS(t *testing.T) {
 }
 
 func TestOpts_MTLS_RBAC(t *testing.T) {
-	rbacPolicy := "some-test-policy"
 	opts := Options{
-		CELPolicies: CELPolicies{
-			rbacPolicy: "!connection.subject_peer_certificate.contains('client')",
-		},
-		MetricsReadOptions: &BackendOptions{
-			MatchRouteRegex: testReadPath,
-			BackendConfig: Backend{
-				Address: httpbinName,
-				Port:    httpPort,
+		Signal: signal,
+		ReadOptions: &ReadBackend{
+			BackendOptions: BackendOptions{
+				BackendConfig: Backend{
+					Address: httpbinName,
+					Port:    httpPort,
+				},
+				MatchRouteRegex: testReadPath,
 			},
 		},
-		MetricsWriteOptions: &BackendOptions{
-			BackendConfig: Backend{
-				Address: httpbinName,
-				Port:    httpPort,
+		WriteOptions: &WriteBackend{
+			RBACPolicies: map[string]string{
+				"some-test-policy": "!connection.subject_peer_certificate.contains('client')",
 			},
-			MatchRouteRegex: testWritePath,
-			MTLSConfig: &MTLSConfig{
-				TrustedCA:  caFilePath,
-				ServerCert: certPath,
-				ServerKey:  keyPath,
+			BackendOptions: BackendOptions{
+				BackendConfig: Backend{
+					Address: httpbinName,
+					Port:    httpPort,
+				},
+				MatchRouteRegex: testWritePath,
+				MTLSConfig: &MTLSConfig{
+					TrustedCA:  caFilePath,
+					ServerCert: certPath,
+					ServerKey:  keyPath,
+				},
 			},
-			NamedCELRBACPolicies: []string{rbacPolicy},
 		},
 	}
+
 	resource := runEnvoy(t, opts.BuildOrDie())
 	port := resource.GetPort(fmt.Sprintf("%d/tcp", ReadListenerPort))
 	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("http://localhost:%s%s", port, testReadPath), nil)
@@ -667,62 +709,97 @@ func TestOpts_MTLS_RBAC(t *testing.T) {
 	}
 }
 
-//func TestOpts_LBAC(t *testing.T) {
-//	providerName := "istio_demo"
-//	jwtProvider := JWTProvider{
-//		Issuer: "testing@secure.istio.io",
-//		RemoteJWKsURI: RemoteJWKSURI{
-//			URI: "https://raw.githubusercontent.com/istio/istio/release-1.23/security/tools/jwt/samples/jwks.json",
-//		},
-//	}
-//
-//	policies := []lbac.RawPolicy{
-//		{
-//			Name:          "some-policy",
-//			CELExpression: "token.sub == 'testing@secure.istio.io'",
-//			Selectors: []lbac.RawSelector{
-//				{
-//
-//					LabelSelector: `{app='test'}`,
-//				},
-//			},
-//		},
-//	}
-//
-//	opts := Options{
-//		LBACServer: &LBACServerConfig{},
-//		TokenAuthConfig: &TokenAuthConfig{
-//			JWTProviders: map[string]JWTProvider{
-//				providerName: jwtProvider,
-//			},
-//		},
-//		MetricsReadOptions: &BackendOptions{
-//			LBACPolicies: policies,
-//			TokenAuthConfig: BackendTokenAuthConfig{
-//				JWTAuth: &BackendJWTAuth{
-//					ProviderName: providerName,
-//				},
-//			},
-//			BackendConfig: Backend{
-//				Address: "httpbin.org",
-//				Port:    80,
-//				Scheme:  "http",
-//			},
-//			MatchRouteRegex: "/anything/api/v1/query",
-//		},
-//	}
-//	resource := runEnvoy(t, opts.BuildOrDie())
-//
-//	readPort := resource.GetPort(fmt.Sprintf("%d/tcp", ReadListenerPort))
-//	resp, err := http.Get(fmt.Sprintf("http://localhost:%s%s", readPort, testReadPath))
-//	if err != nil {
-//		t.Fatalf("could not get response: %s", err)
-//	}
-//	defer resp.Body.Close()
-//	if resp.StatusCode != http.StatusOK {
-//		t.Fatalf("expected status code 200, got %d", resp.StatusCode)
-//	}
-//}
+func TestOpts_LBAC_JWT(t *testing.T) {
+	providerName := "istio_demo"
+	match := "/anything/.*"
+	policies := []lbac.RawPolicy{
+		{
+			Name:          "some-policy",
+			CELExpression: "token.sub == 'testing@secure.istio.io'",
+			Selectors: []lbac.RawSelector{
+				{
+
+					LabelSelector: `{app='test'}`,
+				},
+			},
+		},
+	}
+
+	jwtProvider := JWTProvider{
+		Issuer: "testing@secure.istio.io",
+		RemoteJWKsURI: RemoteJWKSURI{
+			URI: "https://raw.githubusercontent.com/istio/istio/release-1.23/security/tools/jwt/samples/jwks.json",
+		},
+	}
+
+	opts := Options{
+		Signal: signal,
+		TokenAuthConfig: &TokenAuthConfig{
+			JWTProviders: map[string]JWTProvider{
+				providerName: jwtProvider,
+			},
+		},
+		ReadOptions: &ReadBackend{
+			LBACConfig: &LBACConfig{
+				LBACServer: LBACServerConfig{
+					Address:  lbacName,
+					GrpcPort: 3001,
+				},
+				LBACPolicies: policies,
+			},
+			BackendOptions: BackendOptions{
+				MatchRouteRegex: match,
+				BackendConfig: Backend{
+					Address: httpbinName,
+					Port:    httpPort,
+				},
+				TokenAuthConfig: BackendTokenAuthConfig{
+					JWTAuth: &BackendJWTAuth{
+						ProviderName: providerName,
+					},
+				},
+			},
+		},
+	}
+
+	_ = runLBACServer(t)
+	resource := runEnvoy(t, opts.BuildOrDie())
+
+	readPort := resource.GetPort(fmt.Sprintf("%d/tcp", ReadListenerPort))
+	path := "/anything/api/v1/query?query=up"
+	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("http://localhost:%s%s", readPort, path), nil)
+	if err != nil {
+		t.Fatalf("could not create request: %s", err)
+	}
+
+	// This token decodes as follows:
+	// {
+	//  "exp": 4685989700,
+	//  "foo": "bar",
+	//  "iat": 1532389700,
+	//  "iss": "testing@secure.istio.io",
+	//  "sub": "testing@secure.istio.io"
+	// }
+
+	token, err := os.ReadFile("testdata/demo.jwt")
+	if err != nil {
+		t.Fatalf("unable to read file: %v", err)
+	}
+
+	req.Header.Add("Authorization", fmt.Sprintf("Bearer %s", strings.TrimSpace(string(token))))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("could not get response: %s", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected status code 200, got %d", resp.StatusCode)
+	}
+	out := getAnythingResponseBody(t, resp.Body)
+	if !strings.Contains(out.URL, `/anything/api/v1/query?query=up{app%3D"test"}`) {
+		t.Fatalf("expected URL to contain label selector, got %s", out.URL)
+	}
+}
 
 // runEnvoy starts an envoy container with the provided config and returns the resource
 // it copies the certs from the testdata/certs directory to the temp directory and makes them
@@ -795,6 +872,32 @@ func runEnvoy(t *testing.T, withConfig string) *dockertest.Resource {
 	if err != nil {
 		t.Fatalf("could not connect to envoy: %s", err)
 	}
+	return resource
+}
+
+func runLBACServer(t *testing.T) *dockertest.Resource {
+	t.Helper()
+
+	options := dockertest.RunOptions{
+		Name:       lbacName,
+		Repository: lbacImage,
+		Tag:        lbacTag,
+		Networks: []*dockertest.Network{
+			network,
+		},
+	}
+
+	resource, err := pool.RunWithOptions(&options, hostConfig)
+	if err != nil {
+		t.Fatalf("could not start resource: %s", err)
+	}
+
+	t.Cleanup(func() {
+		err := pool.Purge(resource)
+		if err != nil {
+			t.Fatalf("could not purge resource: %s", err)
+		}
+	})
 	return resource
 }
 

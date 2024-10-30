@@ -56,6 +56,9 @@ const (
 	tokenInMetadataPathJWT = "metadata.filter_metadata['envoy.filters.http.jwt_authn'].token."
 )
 
+// RBACPolicies is the list of named CEL policies for role based access control.
+type RBACPolicies map[string]string
+
 // Backend represents a backend service that the proxy will route traffic to.
 type Backend struct {
 	// Address is the address of the backend service.
@@ -67,13 +70,18 @@ type Backend struct {
 	Scheme string
 }
 
+// ReadBackend represents the configuration for the read backend service.
 type ReadBackend struct {
 	BackendOptions
-	// LBACPolicies is the list of named CEL policies for label based access control.
-	LBACPolicies []lbac.RawPolicy
+	// RBACPolicies is the list of CEL policies for role based access control.
+	RBACPolicies RBACPolicies
+	LBACConfig   *LBACConfig
 }
 
+// WriteBackend represents the configuration for the write backend service.
 type WriteBackend struct {
+	// RBACPolicies is the list of CEL policies for role based access control.
+	RBACPolicies RBACPolicies
 	BackendOptions
 }
 
@@ -94,16 +102,14 @@ type BackendOptions struct {
 	TokenAuthConfig BackendTokenAuthConfig
 	// MTLSConfig is the configuration for mTLS.
 	MTLSConfig *MTLSConfig
-	// NamedCELRBACPolicies is the list of named CEL expressions for RBAC.
-	// If not specified, the RBAC will not be checked.
-	// If any of the expressions evaluate to true, the request will be allowed.
-	// If all the expressions evaluate to false, the request will be denied.
-	NamedCELRBACPolicies []string
-	clusterName          string
-	statsPrefix          string
-	listenerName         string
-	listenerPort         uint32
-	attachedRBACPolicies CELPolicies
+	// clusterName is the name of the cluster.
+	clusterName string
+	// statsPrefix is the prefix for the stats.
+	statsPrefix string
+	// listenerName is the name of the listener.
+	listenerName string
+	// listenerPort is the port of the listener.
+	listenerPort uint32
 }
 
 // HeaderMutation represents a mutation to be applied to HTTP headers.
@@ -181,9 +187,6 @@ type BackendTokenAuthConfig struct {
 	JWTAuth *BackendJWTAuth
 }
 
-// CELPolicies is the map of named CEL policies to CEL expressions.
-type CELPolicies map[string]string
-
 // BackendJWTAuth is the per-backend configuration for JWT authentication.
 type BackendJWTAuth struct {
 	// ProviderName is the name of the JWT provider.
@@ -216,23 +219,43 @@ type LBACServerConfig struct {
 	GrpcPort uint32
 }
 
+// LBACConfig is the configuration for label based access control.
+type LBACConfig struct {
+	LBACServer LBACServerConfig
+	// LBACPolicies is the list of CEL policies for label based access control.
+	LBACPolicies []lbac.RawPolicy
+}
+
 // Options is the configuration for the gateway.
 type Options struct {
-	MetricsReadOptions  *ReadBackend
-	MetricsWriteOptions *WriteBackend
-	TokenAuthConfig     *TokenAuthConfig
-	LBACServer          *LBACServerConfig
-	CELPolicies         CELPolicies
+	// Signal is the signal that the gateway manages. EG Metrics, Logs, Traces.
+	Signal string
+	// ReadOptions is the configuration for the read backend service.
+	ReadOptions *ReadBackend
+	// WriteOptions is the configuration for the write backend service.
+	WriteOptions *WriteBackend
+	// TokenAuthConfig is the configuration for token authentication/authorization.
+	TokenAuthConfig *TokenAuthConfig
 }
 
 // BuildOrDie returns raw YAML configuration for envoy proxy or panics if it fails.
 func (opts Options) BuildOrDie() string {
 	var listenerConfigs []*envoylistenerv3.Listener
 
+	var forwardingNamespaces string
 	if opts.TokenAuthConfig != nil {
 		if opts.TokenAuthConfig.JWTProviders != nil {
-			for _, backend := range []*BackendOptions{opts.MetricsReadOptions, opts.MetricsWriteOptions} {
-				if backend != nil && backend.TokenAuthConfig.JWTAuth != nil {
+			var backends []BackendOptions
+			if opts.ReadOptions != nil {
+				backends = append(backends, opts.ReadOptions.BackendOptions)
+			}
+			if opts.WriteOptions != nil {
+				backends = append(backends, opts.WriteOptions.BackendOptions)
+			}
+
+			for _, backend := range backends {
+				if backend.TokenAuthConfig.JWTAuth != nil {
+					forwardingNamespaces = jwtFilterName
 					namedJWTProvider := backend.TokenAuthConfig.JWTAuth.ProviderName
 					if jwtProvider, ok := opts.TokenAuthConfig.JWTProviders[namedJWTProvider]; !ok {
 						panic(fmt.Errorf("JWT provider %s not found in token auth config", namedJWTProvider))
@@ -244,35 +267,36 @@ func (opts Options) BuildOrDie() string {
 		}
 	}
 
-	attachRBACPoliciesOrDie := func(backendOptions *BackendOptions) {
-		if len(backendOptions.NamedCELRBACPolicies) > 0 {
-			backendOptions.attachedRBACPolicies = make(map[string]string, len(backendOptions.NamedCELRBACPolicies))
-			for _, policy := range backendOptions.NamedCELRBACPolicies {
-				if expr, ok := opts.CELPolicies[policy]; !ok {
-					panic(fmt.Errorf("CEL policy %s not found in CEL policies", policy))
-				} else {
-					backendOptions.attachedRBACPolicies[policy] = expr
-				}
-			}
+	if opts.ReadOptions != nil {
+		o := opts.ReadOptions
+		o.clusterName = signalReadClusterName
+		o.listenerName = readListenerName
+		o.listenerPort = ReadListenerPort
+		o.statsPrefix = strings.TrimPrefix(fmt.Sprintf("%s_%s", opts.Signal, readStatsPrefix), "_")
+
+		var filters []*envoyconfigmanagerv3.HttpFilter
+		if len(o.RBACPolicies) > 0 {
+			filters = append(filters, o.RBACPolicies.toHttpFilter())
 		}
+
+		if o.LBACConfig != nil && len(o.LBACConfig.LBACPolicies) > 0 {
+			filters = append(filters, lbacTOHttpFilters(o.LBACConfig.LBACPolicies, forwardingNamespaces)...)
+		}
+		listenerConfigs = append(listenerConfigs, buildListenerConfig(o.BackendOptions, filters...))
 	}
 
-	if opts.MetricsReadOptions != nil {
-		opts.MetricsReadOptions.clusterName = signalReadClusterName
-		opts.MetricsReadOptions.listenerName = readListenerName
-		opts.MetricsReadOptions.listenerPort = ReadListenerPort
-		opts.MetricsReadOptions.statsPrefix = readStatsPrefix
-		attachRBACPoliciesOrDie(opts.MetricsReadOptions)
-		listenerConfigs = append(listenerConfigs, buildListenerConfig(*opts.MetricsReadOptions))
-	}
+	if opts.WriteOptions != nil {
+		o := opts.WriteOptions
+		o.clusterName = signalWriteClusterName
+		o.listenerName = writeListenerName
+		o.listenerPort = WriteListenerPort
+		o.statsPrefix = strings.TrimPrefix(fmt.Sprintf("%s_%s", opts.Signal, writeStatsPrefix), "_")
 
-	if opts.MetricsWriteOptions != nil {
-		opts.MetricsWriteOptions.clusterName = signalWriteClusterName
-		opts.MetricsWriteOptions.listenerName = writeListenerName
-		opts.MetricsWriteOptions.listenerPort = WriteListenerPort
-		opts.MetricsWriteOptions.statsPrefix = writeStatsPrefix
-		attachRBACPoliciesOrDie(opts.MetricsWriteOptions)
-		listenerConfigs = append(listenerConfigs, buildListenerConfig(*opts.MetricsWriteOptions))
+		var filters []*envoyconfigmanagerv3.HttpFilter
+		if len(o.RBACPolicies) > 0 {
+			filters = append(filters, o.RBACPolicies.toHttpFilter())
+		}
+		listenerConfigs = append(listenerConfigs, buildListenerConfig(o.BackendOptions, filters...))
 	}
 
 	bootstrap := &envoyconfigbootstrapv3.Bootstrap{
@@ -297,25 +321,19 @@ func (opts Options) BuildOrDie() string {
 	return string(y)
 }
 
-func buildListenerConfig(opts BackendOptions) *envoylistenerv3.Listener {
+func buildListenerConfig(opts BackendOptions, filters ...*envoyconfigmanagerv3.HttpFilter) *envoylistenerv3.Listener {
 	var httpFilters []*envoyconfigmanagerv3.HttpFilter
-	var forwardingNamespacedMetadata string
 
 	if len(opts.HeaderMutations) > 0 {
 		httpFilters = append(httpFilters, opts.HeaderMutations.toHttpFilter())
 	}
 
 	if opts.TokenAuthConfig.JWTAuth != nil {
-		forwardingNamespacedMetadata = jwtFilterName
 		httpFilters = append(httpFilters, opts.TokenAuthConfig.JWTAuth.toHttpFilter(opts.MatchRouteRegex))
 	}
 
-	if len(opts.attachedRBACPolicies) > 0 {
-		httpFilters = append(httpFilters, opts.attachedRBACPolicies.toHttpFilter())
-	}
-
-	if len(opts.LBACPolicies) > 0 {
-		httpFilters = append(httpFilters, lbacTOHttpFilters(opts.LBACPolicies, forwardingNamespacedMetadata)...)
+	if len(filters) > 0 {
+		httpFilters = append(httpFilters, filters...)
 	}
 
 	connManager := buildHTTPConnectionManager(opts, httpFilters)
@@ -404,20 +422,20 @@ func buildHTTPConnectionManager(opts BackendOptions, httpFilters []*envoyconfigm
 
 func (opts Options) toClusters() []*envoyconfigclusterv3.Cluster {
 	var clusters []*envoyconfigclusterv3.Cluster
-	if opts.MetricsReadOptions != nil {
-		clusters = append(clusters, opts.MetricsReadOptions.BackendConfig.toCluster(signalReadClusterName))
+	if opts.ReadOptions != nil {
+		clusters = append(clusters, opts.ReadOptions.BackendConfig.toCluster(signalReadClusterName))
 	}
 
-	if opts.MetricsWriteOptions != nil {
-		clusters = append(clusters, opts.MetricsWriteOptions.BackendConfig.toCluster(signalWriteClusterName))
+	if opts.WriteOptions != nil {
+		clusters = append(clusters, opts.WriteOptions.BackendConfig.toCluster(signalWriteClusterName))
 	}
 
 	if opts.TokenAuthConfig != nil && len(opts.TokenAuthConfig.JWTProviders) > 0 {
 		clusters = append(clusters, opts.TokenAuthConfig.JWTProviders.toClusters()...)
 	}
 
-	if opts.LBACServer != nil {
-		clusters = append(clusters, opts.LBACServer.toCluster())
+	if opts.ReadOptions != nil && opts.ReadOptions.LBACConfig != nil {
+		clusters = append(clusters, opts.ReadOptions.LBACConfig.LBACServer.toCluster())
 	}
 
 	return clusters
@@ -694,13 +712,13 @@ func (bja BackendJWTAuth) toHttpFilter(matchPrefixRegex string) *envoyconfigmana
 	return jwtHTTPFilter
 }
 
-func (c CELPolicies) toHttpFilter() *envoyconfigmanagerv3.HttpFilter {
-	if len(c) == 0 {
+func (p RBACPolicies) toHttpFilter() *envoyconfigmanagerv3.HttpFilter {
+	if len(p) == 0 {
 		return nil
 	}
 
 	policies := make(map[string]*rbacv3.Policy)
-	for k, expr := range c {
+	for k, expr := range p {
 		expr = strings.Replace(expr, "token.", tokenInMetadataPathJWT, -1)
 
 		parsedAST, err := cel.Parse(expr, k)
