@@ -167,7 +167,7 @@ func TestOpts_Routing(t *testing.T) {
 	}
 }
 
-func TestOpts_HeaderManipulation(t *testing.T) {
+func TestOpts_HeaderManipulation_FromHeader(t *testing.T) {
 	fromHeader := "X-Some-Test-Header"
 	fromHeaderVal := "test"
 	toHeader := "X-Thanos-Tenant"
@@ -215,6 +215,75 @@ func TestOpts_HeaderManipulation(t *testing.T) {
 	respBody := getAnythingResponseBody(t, resp.Body)
 	if respBody.Headers[toHeader] != fromHeaderVal {
 		t.Fatalf("expected header %s to be %s, got %s", toHeader, fromHeaderVal, respBody.Headers[toHeader])
+	}
+}
+
+func TestOpts_HeaderManipulation_FromClientCertificate(t *testing.T) {
+	toHeader := "X-Thanos-Tenant"
+
+	opts := Options{
+		Signal: signal,
+		WriteOptions: &WriteBackend{
+			BackendOptions: BackendOptions{
+				BackendConfig: Backend{
+					Address: httpbinName,
+					Port:    httpPort,
+				},
+				MatchRouteRegex: testWritePath,
+				HeaderMutations: []HeaderMutation{
+					{
+						SetHeader: toHeader,
+						FromValue: ClientCertInfoPeerDNSSan,
+					},
+				},
+				MTLSConfig: &MTLSConfig{
+					TrustedCA:  caFilePath,
+					ServerCert: certPath,
+					ServerKey:  keyPath,
+				},
+			},
+		},
+	}
+
+	resource := runEnvoy(t, opts.BuildOrDie())
+	port := resource.GetPort(fmt.Sprintf("%d/tcp", WriteListenerPort))
+	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("https://localhost:%s%s", port, testWritePath), nil)
+	if err != nil {
+		t.Fatalf("could not create request: %s", err)
+	}
+
+	caCert, err := os.ReadFile("testdata/certs/ca.pem")
+	if err != nil {
+		t.Fatalf("could not read ca cert: %s", err)
+	}
+	caCertPool := x509.NewCertPool()
+	caCertPool.AppendCertsFromPEM(caCert)
+
+	cert, err := tls.LoadX509KeyPair("testdata/certs/client.pem", "testdata/certs/client-key.pem")
+	if err != nil {
+		t.Fatalf("could not load client cert: %s", err)
+	}
+
+	client := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				RootCAs:      caCertPool,
+				Certificates: []tls.Certificate{cert},
+			},
+		},
+	}
+	expectOkResp, expectNoErr := client.Do(req)
+	if expectNoErr != nil {
+		t.Fatalf("expected no error, got %s", expectNoErr)
+	}
+
+	if expectOkResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected status code 200, got %d", expectOkResp.StatusCode)
+	}
+
+	respBody := getAnythingResponseBody(t, expectOkResp.Body)
+	if respBody.Headers[toHeader] != "localhost" {
+		t.Fatalf("expected header %s to be localhost, got %s", toHeader, respBody.Headers[toHeader])
 	}
 }
 

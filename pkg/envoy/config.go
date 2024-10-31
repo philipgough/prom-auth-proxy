@@ -140,6 +140,36 @@ func (ehm ExistingHeaderMutation) String() string {
 	return fmt.Sprintf(`%%REQ(%s)%%`, ehm.FromRequestHeader)
 }
 
+// ClientCertInfo represents some aspect of the client certificate that can be extracted.
+// These values can be extracted from the client certificate and used to add as a header to the request.
+type ClientCertInfo int
+
+const (
+	// ClientCertInfoPeerIPSan is ip addresses present in the SAN of the peer certificate
+	ClientCertInfoPeerIPSan ClientCertInfo = iota
+	// ClientCertInfoPeerDNSSan is dns names present in the SAN of the peer certificate
+	ClientCertInfoPeerDNSSan
+	// ClientCertInfoPeerURISan is URIs present in the SAN of the peer certificate
+	ClientCertInfoPeerURISan
+	// ClientCertInfoPeerEmailSAN is email addresses present in the SAN of the peer certificate
+	ClientCertInfoPeerEmailSAN
+	// ClientCertInfoPeerOtherNamesSAN is OtherNames present in the SAN of the peer certificate
+	ClientCertInfoPeerOtherNamesSAN
+	// ClientCertInfoPeerSubject is the subject of the peer certificate
+	ClientCertInfoPeerSubject
+	// ClientCertInfoPeerIssuer is the issuer of the peer certificate
+	ClientCertInfoPeerIssuer
+)
+
+// String returns the string representation of the ClientCertInfo.
+func (ci ClientCertInfo) String() string {
+	v := [...]string{
+		"DOWNSTREAM_PEER_IP_SAN", "DOWNSTREAM_PEER_DNS_SAN", "DOWNSTREAM_PEER_URI_SAN", "DOWNSTREAM_PEER_EMAIL_SAN",
+		"DOWNSTREAM_PEER_OTHERNAME_SAN", "DOWNSTREAM_PEER_SUBJECT", "DOWNSTREAM_PEER_ISSUER",
+	}[ci]
+	return fmt.Sprintf(`%%%s%%`, v)
+}
+
 // HeaderAmendments allows the addition and removal of headers after a route is
 // matched but before the request is sent to the backend.
 type HeaderAmendments struct {
@@ -434,9 +464,9 @@ func buildHTTPConnectionManager(opts BackendOptions, httpFilters []*envoyconfigm
 	routes := []*envoyroutev3.Route{opts.toRoute()}
 
 	return &envoyconfigmanagerv3.HttpConnectionManager{
-		CodecType:  envoyconfigmanagerv3.HttpConnectionManager_AUTO,
-		StatPrefix: opts.statsPrefix,
-
+		CodecType:         envoyconfigmanagerv3.HttpConnectionManager_AUTO,
+		StatPrefix:        opts.statsPrefix,
+		GenerateRequestId: &wrappers.BoolValue{Value: true},
 		RouteSpecifier: &envoyconfigmanagerv3.HttpConnectionManager_RouteConfig{
 			RouteConfig: &envoyroutev3.RouteConfiguration{
 				Name: "service",
